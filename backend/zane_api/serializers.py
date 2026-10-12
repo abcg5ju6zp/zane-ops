@@ -69,12 +69,39 @@ class UserSerializer(serializers.ModelSerializer):
         fields = ["username", "first_name", "last_name", "is_superuser"]
 
 
+class WorkspaceRetirementSummarySerializer(serializers.Serializer):
+    generation = serializers.UUIDField(read_only=True)
+    status = serializers.CharField(read_only=True)
+    delivery_status = serializers.CharField(read_only=True)
+    progress = serializers.DictField(read_only=True)
+    finalized_at = serializers.DateTimeField(read_only=True, allow_null=True)
+
+
 class WorkspaceSerializer(serializers.ModelSerializer):
+    retirement = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = models.Workspace
-        fields = ["id", "name"]
+        fields = ["id", "name", "retirement"]
         extra_kwargs = {
             "id": {"read_only": True},
+        }
+
+    @extend_schema_field(WorkspaceRetirementSummarySerializer(allow_null=True))
+    def get_retirement(self, obj: models.Workspace):
+        # local import to avoid pulling the retirement service (and its
+        # temporal payload imports) into the serializer module at import time
+        from .retirement import get_active_retirement
+
+        retirement = get_active_retirement(workspace=obj)
+        if retirement is None:
+            return None
+        return {
+            "generation": str(retirement.generation),
+            "status": retirement.status,
+            "delivery_status": retirement.delivery_status,
+            "progress": retirement.progress,
+            "finalized_at": retirement.finalized_at,
         }
 
 

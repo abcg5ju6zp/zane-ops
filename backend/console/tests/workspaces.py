@@ -7,6 +7,7 @@ from rest_framework import status
 from zane_api.models import (
     Workspace,
     WorkspaceMembership,
+    WorkspaceRetirement,
     WorkspaceRole,
     Project,
     Service,
@@ -172,7 +173,7 @@ class DeleteWorkspaceViewTests(AuthAPITestCase):
         self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
         self.assertFalse(Workspace.objects.filter(pk=workspace.pk).exists())
 
-    def test_deleting_workspace_also_deletes_its_projects_and_services(self):
+    def test_deleting_nonempty_workspace_starts_queryable_retirement(self):
         self.loginUser()
 
         project, _ = self.create_and_deploy_caddy_docker_service()
@@ -180,9 +181,22 @@ class DeleteWorkspaceViewTests(AuthAPITestCase):
         response = self.client.delete(
             reverse("console:workspace.detail", kwargs={"id": workspace.pk})
         )
-        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
-        self.assertEqual(0, Project.objects.filter(workspace=workspace).count())
+        # non-empty workspaces enter a queryable retirement generation first
+        self.assertEqual(status.HTTP_202_ACCEPTED, response.status_code)
+        self.assertEqual("RETIRING", response.json()["status"])
+        # service rows are archived/removed immediately, workspace stays visible
         self.assertEqual(0, Service.objects.filter(project=project).count())
+        self.assertTrue(Workspace.objects.filter(pk=workspace.pk).exists())
+
+        # repeated delete returns the same generation
+        response = self.client.delete(
+            reverse("console:workspace.detail", kwargs={"id": workspace.pk})
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(
+            str(WorkspaceRetirement.objects.get(workspace=workspace).generation),
+            response.json()["generation"],
+        )
 
     def test_non_instance_owner_cannot_delete_workspace(self):
         user = User.objects.create_user(username="mohai", password="password")
@@ -276,7 +290,17 @@ class DeleteWorkspaceViewTests(AuthAPITestCase):
                 kwargs={"id": project.workspace_id},
             )
         )
-        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        self.assertEqual(status.HTTP_202_ACCEPTED, response.status_code)
+        generation = response.json()["generation"]
+
+        # the on-commit cleanup workflow runs through to finalization
+        retirement = await WorkspaceRetirement.objects.aget(generation=generation)
+        self.assertEqual(
+            WorkspaceRetirement.RetirementStatus.COMPLETED, retirement.status
+        )
+        self.assertIsNone(
+            await Workspace.objects.filter(pk=project.workspace_id).afirst()
+        )
 
         self.assertEqual(
             0,

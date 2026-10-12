@@ -8,32 +8,24 @@ from rest_framework.response import Response
 from rest_framework.generics import ListAPIView, RetrieveUpdateDestroyAPIView
 from rest_framework.views import APIView
 
-from rest_framework import exceptions
-from temporal.client import TemporalClient
-from temporal.shared import (
-    ArchivedProjectDetails,
-    EnvironmentDetails,
-    ComposeStackArchiveDetails,
-)
-from temporal.workflows import RemoveProjectResourcesWorkflow
+from rest_framework import exceptions, status
 
 from zane_api.models import (
     Workspace,
     WorkspaceMembership,
     WorkspaceRole,
-    ArchivedProject,
-    Service,
-    PortConfiguration,
-    Volume,
-    URL,
-    Config,
-    ArchivedDockerService,
-    ArchivedGitService,
 )
 from zane_api.constants import WORKSPACE_SESSION_KEY
 from zane_api.permissions import IsInstanceOwner
+from zane_api.retirement import (
+    get_active_retirement,
+    retirement_serialized,
+    schedule_dispatch_after_commit,
+    start_workspace_retirement,
+)
 
 from .serializers import WorkspaceListFilterSet
+from zane_api.views.serializers import WorkspaceRetirementProgressSerializer
 from ..serializers import (
     WorkspaceDetailSerializer,
     WorkspaceTransferOwnershipSerializer,
@@ -103,107 +95,54 @@ class WorkspaceDetailAPIView(RetrieveUpdateDestroyAPIView):
     def get_object(self) -> Workspace:  # type: ignore
         return super().get_object()
 
-    @transaction.atomic()
-    def perform_destroy(self, instance: Workspace):
-        workflow_payloads: list[tuple[ArchivedProjectDetails, str]] = []
-
-        for project in instance.projects.all():
-            archived_version = ArchivedProject.get_or_create_from_project(project)
-
-            docker_service_list = (
-                Service.objects.filter(Q(project=project))
-                .select_related("project", "healthcheck")
-                .prefetch_related(
-                    "volumes", "ports", "urls", "env_variables", "deployments"
-                )
+    def perform_update(self, serializer):
+        # The console bypasses `HasWorkspace`, so the retirement freeze is
+        # enforced explicitly here: a frozen workspace cannot be renamed.
+        if get_active_retirement(workspace=serializer.instance) is not None:
+            raise ResourceConflict(
+                "This workspace is being retired and cannot be edited."
             )
-            id_list = []
-            for service in docker_service_list:
-                if service.deployments.count() > 0:
-                    if service.type == Service.ServiceType.DOCKER_REGISTRY:
-                        ArchivedDockerService.create_from_service(
-                            service, archived_version
-                        )
-                    else:
-                        ArchivedGitService.create_from_service(
-                            service, archived_version
-                        )
-                    id_list.append(service.id)
+        return super().perform_update(serializer)
 
-            PortConfiguration.objects.filter(Q(service__id__in=id_list)).delete()
-            URL.objects.filter(Q(service__id__in=id_list)).delete()
-            Volume.objects.filter(Q(service__id__in=id_list)).delete()
-            Config.objects.filter(Q(service__id__in=id_list)).delete()
-            for service in docker_service_list:
-                if service.healthcheck is not None:
-                    service.healthcheck.delete()
-            # Delete Preview metadata before the services because they hold protected references
-            # to the services
-            for env in project.environments.filter().select_related("preview_metadata"):
-                if env.preview_metadata is not None:
-                    env.preview_metadata.delete()
-            docker_service_list.delete()
-
-            workflow_payloads.append(
-                (
-                    ArchivedProjectDetails(
-                        id=archived_version.pk,
-                        original_id=archived_version.original_id,
-                        environments=[
-                            EnvironmentDetails(
-                                id=env.original_id,
-                                name=env.name,
-                                project_id=archived_version.original_id,
-                            )
-                            for env in archived_version.environments.all()
-                        ],
-                        compose_stacks=[
-                            ComposeStackArchiveDetails(stack=stack.snapshot)
-                            for stack in project.compose_stacks.filter(
-                                user_content__isnull=False
-                            )
-                            .prefetch_related("env_overrides")
-                            .all()
-                        ],
-                    ),
-                    archived_version.workflow_id,
-                )
-            )
-
-        def commit_callback():
-            for payload, workflow_id in workflow_payloads:
-                TemporalClient.start_workflow(
-                    RemoveProjectResourcesWorkflow.run,
-                    payload,
-                    id=workflow_id,
-                )
-
-        transaction.on_commit(commit_callback)
-
-        return super().perform_destroy(instance)
-
-    @extend_schema(summary="Delete a workspace (admin)")
+    @extend_schema(
+        summary="Delete a workspace (admin)",
+        responses={204: None, 202: WorkspaceRetirementProgressSerializer, 200: WorkspaceRetirementProgressSerializer},
+    )
     def delete(self, request: Request, *args, **kwargs):
-        workspace_id = self.get_object().id
+        workspace = self.get_object()
 
-        response = super().delete(request, *args, **kwargs)
+        # Idempotent: repeated delete returns the same generation progress.
+        retirement = get_active_retirement(workspace=workspace)
+        if retirement is not None:
+            return Response(
+                retirement_serialized(retirement),
+                status=status.HTTP_200_OK,
+            )
 
-        # If the instance owner was currently in the deleted workspace,
-        # switch their session to another workspace they are a member of
-        if request.session.get(WORKSPACE_SESSION_KEY) == workspace_id:
-            last_membership = (
-                WorkspaceMembership.objects.filter(
-                    user=request.user,
+        # Empty workspace: historical one-shot delete behaviour.
+        if not workspace.projects.exists():
+            workspace_id = workspace.id
+            workspace.delete()
+            if request.session.get(WORKSPACE_SESSION_KEY) == workspace_id:
+                last_membership = (
+                    WorkspaceMembership.objects.filter(user=request.user)
+                    .exclude(workspace_id=workspace_id)
+                    .select_related("workspace")
+                    .first()
                 )
-                .exclude(workspace_id=workspace_id)
-                .select_related("workspace")
-                .first()
-            )
-            request.session[WORKSPACE_SESSION_KEY] = (
-                last_membership.workspace.id if last_membership is not None else None
-            )
+                request.session[WORKSPACE_SESSION_KEY] = (
+                    last_membership.workspace.id
+                    if last_membership is not None
+                    else None
+                )
+            return Response(status=status.HTTP_204_NO_CONTENT)
 
-        return response
+        with transaction.atomic():
+            retirement = start_workspace_retirement(workspace)
+            schedule_dispatch_after_commit(retirement)
+            payload = retirement_serialized(retirement)
+
+        return Response(payload, status=status.HTTP_202_ACCEPTED)
 
 
 class WorkspaceTransferOwnershipAPIView(APIView):

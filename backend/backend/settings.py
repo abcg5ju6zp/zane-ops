@@ -511,6 +511,10 @@ APP_DATA_CLEANUP_SCHEDULE_ID = "daily-app-data-cleanup"
 OLD_DOCKER_SYSTEM_PRUNE_SCHEDULE_ID = "hourly-system-cleanup"
 DOCKER_SYSTEM_PRUNE_SCHEDULE_ID = "docker-system-prune"
 
+# Periodic restart recovery for in-progress workspace retirements (redeliver
+# lost cleanup workflows, finalize fully confirmed generations), runs every minute
+WORKSPACE_RETIREMENT_RECONCILE_SCHEDULE_ID = "workspace-retirement-reconcile"
+
 # GeoIP, the DB is optional : when the operator doesn't provide one,
 # `/dev/null` is bind-mounted at that path, so we only consider GeoIP
 # configured when the path points to a real file

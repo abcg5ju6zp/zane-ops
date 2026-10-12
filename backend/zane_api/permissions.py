@@ -6,7 +6,8 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AbstractUser, AnonymousUser
 from django.db.models import QuerySet
-from rest_framework.permissions import BasePermission
+from rest_framework import exceptions
+from rest_framework.permissions import SAFE_METHODS, BasePermission
 from rest_framework.request import Request
 
 from .constants import WORKSPACE_SESSION_KEY
@@ -16,10 +17,44 @@ from .models import (
     Workspace,
     WorkspaceApiToken,
     WorkspaceMembership,
+    WorkspaceRetirement,
     WorkspaceRole,
 )
 
 User = get_user_model()
+
+
+class WorkspaceRetiring(exceptions.APIException):
+    """The workspace is frozen in a retirement generation."""
+
+    status_code = 409
+    default_detail = (
+        "This workspace is being retired: projects, deployments, membership "
+        "and token changes are rejected until the cleanup completes."
+    )
+    default_code = "workspace_retiring"
+
+
+def enforce_workspace_not_retiring(
+    request: Request, view: Any, workspace: Workspace
+) -> None:
+    """
+    Freeze every write on a retiring workspace. Reads stay allowed (the
+    generation is queryable) and views can opt out via
+    ``allow_retiring_workspace_writes`` (e.g. the idempotent DELETE itself and
+    the session-only workspace switch).
+    """
+    allowed = getattr(view, "allow_retiring_workspace_writes", False)
+    if callable(allowed):
+        allowed = allowed(request)
+    if request.method in SAFE_METHODS or allowed:
+        return
+    is_retiring = WorkspaceRetirement.objects.filter(
+        workspace=workspace,
+        status=WorkspaceRetirement.RetirementStatus.RETIRING,
+    ).exists()
+    if is_retiring:
+        raise WorkspaceRetiring()
 
 
 @dataclass(frozen=True)
@@ -194,6 +229,12 @@ class HasWorkspace(BasePermission):
 
             request.workspace = access.workspace  # type: ignore
             request.access = access  # type: ignore
+            request.workspace_retirement = (
+                WorkspaceRetirement.objects.filter(workspace=access.workspace)
+                .filter(status=WorkspaceRetirement.RetirementStatus.RETIRING)
+                .first()
+            )
+            enforce_workspace_not_retiring(request, view, access.workspace)
             return True
 
         workspace_id = request.session.get(WORKSPACE_SESSION_KEY)
@@ -205,6 +246,19 @@ class HasWorkspace(BasePermission):
 
         workspace = qs.order_by("created_at").first()
 
+        if workspace is None and workspace_id is not None:
+            # The current/default workspace has been retired under this session
+            # (membership cascade removed): deterministically converge the
+            # current session to the user's earliest remaining workspace instead
+            # of locking them out.
+            workspace = (
+                Workspace.objects.filter(memberships__user=request.user)
+                .order_by("created_at")
+                .first()
+            )
+            if workspace is not None:
+                request.session[WORKSPACE_SESSION_KEY] = workspace.id
+
         if workspace is None:
             return False
 
@@ -212,6 +266,13 @@ class HasWorkspace(BasePermission):
         request.access = build_session_access(  # type: ignore
             cast(AbstractUser, request.user), workspace
         )
+        request.workspace_retirement = (
+            WorkspaceRetirement.objects.filter(workspace=workspace)
+            .filter(status=WorkspaceRetirement.RetirementStatus.RETIRING)
+            .first()
+        )
+        if request.access is not None:
+            enforce_workspace_not_retiring(request, view, workspace)
         return request.access is not None
 
 

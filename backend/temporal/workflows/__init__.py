@@ -6,12 +6,14 @@ from .services import *
 from .projects import *
 from .registries import *
 from .compose import *
+from .workspace_retirement import *
 
 with workflow.unsafe.imports_passed_through():
     from ..activities import (
         DockerSwarmActivities,
         DockerSystemPruneActivities,
         GitActivities,
+        WorkspaceRetirementActivities,
         delete_env_resources,
         acquire_service_deploy_semaphore,
         release_service_deploy_semaphore,
@@ -59,6 +61,11 @@ with workflow.unsafe.imports_passed_through():
         DeployComposeStackWorkflow,
         ArchiveComposeStackWorkflow,
         ToggleComposeStackWorkflow,
+        WorkspaceRetirementWorkflow,
+        RetireWorkspaceServiceWorkflow,
+        RetireWorkspaceStackWorkflow,
+        RetireWorkspaceEnvironmentWorkflow,
+        RetireWorkspaceProjectWorkflow,
     )
     from ..schedules import (
         MonitorDockerDeploymentWorkflow,
@@ -74,6 +81,7 @@ with workflow.unsafe.imports_passed_through():
         close_faulty_db_connections,
         MonitorComposeStackActivites,
         MonitorComposeStackWorkflow,
+        ReconcileWorkspaceRetirementsWorkflow,
     )
 
 
@@ -88,6 +96,7 @@ def get_workflows_and_activities():
     monitor_stack_activites = MonitorComposeStackActivites()
     stack_activites = ComposeStackActivities()
     stack_metrics_activites = DockerComposeStackMetricsActivities()
+    workspace_retirement_activities = WorkspaceRetirementActivities()
 
     return dict(
         workflows=[
@@ -116,6 +125,12 @@ def get_workflows_and_activities():
             ArchiveComposeStackWorkflow,
             ToggleComposeStackWorkflow,
             CollectComposeStacksMetricsWorkflow,
+            WorkspaceRetirementWorkflow,
+            RetireWorkspaceServiceWorkflow,
+            RetireWorkspaceStackWorkflow,
+            RetireWorkspaceEnvironmentWorkflow,
+            RetireWorkspaceProjectWorkflow,
+            ReconcileWorkspaceRetirementsWorkflow,
         ],
         activities=[
             *get_extra_activities(),
@@ -237,5 +252,13 @@ def get_workflows_and_activities():
             close_faulty_db_connections,
             create_registry_health_check_schedule,
             delete_registry_health_check_schedule,
+            workspace_retirement_activities.get_retirement_projects,
+            workspace_retirement_activities.get_unconfirmed_unit_keys,
+            workspace_retirement_activities.mark_cleanup_task_started,
+            workspace_retirement_activities.mark_cleanup_task_failed,
+            workspace_retirement_activities.mark_cleanup_task_confirmed,
+            workspace_retirement_activities.confirm_cleanup_resources,
+            workspace_retirement_activities.finalize_workspace_retirement,
+            workspace_retirement_activities.reconcile_workspace_retirements,
         ],
     )

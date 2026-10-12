@@ -1,5 +1,6 @@
 from typing import cast
 
+from asgiref.sync import sync_to_async
 from django.contrib.auth.models import User
 from django.urls import reverse
 from rest_framework import status
@@ -7,6 +8,7 @@ from rest_framework import status
 from ..models import (
     Workspace,
     WorkspaceMembership,
+    WorkspaceRetirement,
     WorkspaceRole,
     Project,
     Service,
@@ -365,7 +367,7 @@ class SwitchWorkspaceViewTests(AuthAPITestCase):
 
 
 class DeleteWorkspaceViewTests(AuthAPITestCase):
-    def test_delete_workspace_deletes_projects_and_services(self):
+    def test_delete_nonempty_workspace_starts_queryable_retirement(self):
         user = self.loginUser()
         first_workspace = cast(Workspace, Workspace.objects.first())
 
@@ -380,13 +382,38 @@ class DeleteWorkspaceViewTests(AuthAPITestCase):
         self.create_and_deploy_git_service()
 
         response = self.client.delete(reverse("zane_api:workspace.details"))
-        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        # non-empty workspace enters a queryable retirement generation instead of
+        # disappearing immediately
+        self.assertEqual(status.HTTP_202_ACCEPTED, response.status_code)
+        body = response.json()
+        self.assertEqual("RETIRING", body["status"])
+        self.assertIn("generation", body)
+        self.assertTrue(body["progress"]["total_units"] > 0)
 
-        self.assertIsNone(Workspace.objects.filter(pk=first_workspace.id).first())
-        self.assertEqual(Project.objects.count(), 0)
+        # workspace is still visible while retiring ...
+        self.assertEqual(
+            first_workspace,
+            Workspace.objects.filter(pk=first_workspace.id).first(),
+        )
+        # ... but services are archived and their DB rows removed exactly once
         self.assertEqual(Service.objects.count(), 0)
+        self.assertEqual(ArchivedDockerService.objects.count(), 1)
+        self.assertEqual(ArchivedGitService.objects.count(), 1)
 
-    def test_delete_workspace_update_workspace_session_key(self):
+        # the other workspace is untouched
+        self.assertEqual(
+            second_workspace,
+            Workspace.objects.filter(pk=second_workspace.id).first(),
+        )
+
+        # repeated delete returns the SAME generation (no re-archive/re-delete)
+        response = self.client.delete(reverse("zane_api:workspace.details"))
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(body["generation"], response.json()["generation"])
+        self.assertEqual(ArchivedDockerService.objects.count(), 1)
+        self.assertEqual(ArchivedGitService.objects.count(), 1)
+
+    def test_delete_empty_workspace_is_immediate_and_updates_session(self):
         user = self.loginUser()
 
         first_workspace = cast(Workspace, Workspace.objects.first())
@@ -397,17 +424,12 @@ class DeleteWorkspaceViewTests(AuthAPITestCase):
             user=user,
             workspace=second_workspace,
         )
-        response = self.client.post(
-            reverse("zane_api:projects.list"),
-            data={"slug": "zane-ops"},
-        )
-        jprint(response.json())
-        self.assertEqual(status.HTTP_201_CREATED, response.status_code)
-        self.assertEqual(1, Project.objects.count())
 
+        # empty workspace keeps the historical one-shot delete behaviour
         response = self.client.delete(reverse("zane_api:workspace.details"))
         self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
 
+        self.assertIsNone(Workspace.objects.filter(pk=first_workspace.id).first())
         self.assertNotEqual(
             self.client.session.get(WORKSPACE_SESSION_KEY), first_workspace.id
         )
@@ -416,7 +438,18 @@ class DeleteWorkspaceViewTests(AuthAPITestCase):
         )
 
     async def test_delete_workspace_deletes_projects_resources(self):
-        await self.aLoginUser()
+        user = await self.aLoginUser()
+        first_workspace = await Workspace.objects.aget(
+            memberships__user=user
+        )
+        second_workspace = await sync_to_async(Workspace.objects.create)(
+            name="Second workspace"
+        )
+        await WorkspaceMembership.objects.acreate(
+            role=WorkspaceRole.MEMBER,
+            user=user,
+            workspace=second_workspace,
+        )
 
         project, service1 = await self.acreate_and_deploy_caddy_docker_service(
             other_changes=[
@@ -485,7 +518,45 @@ class DeleteWorkspaceViewTests(AuthAPITestCase):
         project, service2 = await self.acreate_and_deploy_git_service()
 
         response = await self.async_client.delete(reverse("zane_api:workspace.details"))
-        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        # the generation is opened first; the on-commit cleanup workflow runs
+        # through to finalization (the test bridge starts it synchronously)
+        self.assertEqual(status.HTTP_202_ACCEPTED, response.status_code)
+        self.assertEqual("RETIRING", response.json()["status"])
+
+        # finalization hides the workspace and converges ownership/memberships
+        self.assertIsNone(
+            await Workspace.objects.filter(pk=first_workspace.id).afirst()
+        )
+        retirement = await WorkspaceRetirement.objects.aget(
+            workspace_original_id=first_workspace.id
+        )
+        self.assertEqual(
+            WorkspaceRetirement.RetirementStatus.COMPLETED, retirement.status
+        )
+        self.assertIsNone(retirement.workspace_id)
+        self.assertEqual(
+            0,
+            await WorkspaceMembership.objects.filter(
+                workspace_id=first_workspace.id
+            ).acount(),
+        )
+        # the other workspace is untouched
+        self.assertIsNotNone(
+            await Workspace.objects.filter(pk=second_workspace.id).afirst()
+        )
+        self.assertEqual(
+            1,
+            await WorkspaceMembership.objects.filter(
+                workspace_id=second_workspace.id
+            ).acount(),
+        )
+        # stale session is deterministically repointed to the remaining ws
+        response = await self.async_client.get(reverse("zane_api:auth.me"))
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(
+            second_workspace.id,
+            response.json()["membership"]["workspace"]["id"],
+        )
 
         # Service are deleted
         self.assertEqual(

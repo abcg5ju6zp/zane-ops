@@ -20,7 +20,13 @@ from ..shared import (
     RegistrySnaphot,
     ComposeStackSnapshot,
     ComposeStackHealthcheckResult,
+    RetirementReconcileResult,
 )
+
+with workflow.unsafe.imports_passed_through():
+    # import the submodule directly: this module is itself imported while the
+    # `temporal.activities` package __init__ is still being initialized
+    from ..activities.workspace_retirement import WorkspaceRetirementActivities
 
 with workflow.unsafe.imports_passed_through():
     from django.conf import settings
@@ -239,4 +245,26 @@ class CleanupAppDataWorkflow:
             service_metrics_deleted_count=service_metrics_deleted_count,
             stack_metrics_deleted_count=stack_metrics_deleted_count,
             http_logs_deleted_count=http_logs_deleted_count,
+        )
+
+
+@workflow.defn(name="reconcile-workspace-retirements")
+class ReconcileWorkspaceRetirementsWorkflow:
+    """Periodic restart recovery for workspace retirement generations.
+
+    Re-delivers top-level workflows whose start was lost / failed and finalizes
+    generations whose cleanup units are all confirmed. Only unconfirmed units
+    of existing generations are touched; nothing is ever archived or deleted a
+    second time.
+    """
+
+    @workflow.run
+    async def run(self) -> RetirementReconcileResult:
+        retry_policy = RetryPolicy(
+            maximum_attempts=3, maximum_interval=timedelta(seconds=30)
+        )
+        return await workflow.execute_activity_method(
+            WorkspaceRetirementActivities.reconcile_workspace_retirements,
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=retry_policy,
         )

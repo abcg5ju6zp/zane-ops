@@ -35,6 +35,7 @@ with workflow.unsafe.imports_passed_through():
         format_duration,
     )
     from zane_api.process import AyncSubProcessRunner
+    from zane_api.models import WorkspaceRetirement
     from django.db.models import Case, F, Value, When
     from docker.models.services import Service as DockerService
     from django.conf import settings
@@ -296,6 +297,16 @@ class ComposeStackActivities:
                 if cancel_event.is_set():
                     break
 
+                # Generation guard: a late stack health loop must not resurrect
+                # the services of a retiring workspace.
+                if await WorkspaceRetirement.objects.filter(
+                    status=WorkspaceRetirement.RetirementStatus.RETIRING,
+                    workspace__projects__compose_stacks__id=deployment.stack.id,
+                ).aexists():
+                    return ComposeStackDeployment.DeploymentStatus.FINISHED, (
+                        "Workspace is being retired, skipping stack health check."
+                    )
+
                 check_attempts += 1
                 time_left = total_time.total_seconds() - (monotonic() - start_time)
 
@@ -461,6 +472,14 @@ class ComposeStackActivities:
                 "===========================================================================",
             ],
         )
+
+        # Generation guard: a late finalize must not mark a stack deployment
+        # FINISHED in a retiring workspace.
+        if await WorkspaceRetirement.objects.filter(
+            status=WorkspaceRetirement.RetirementStatus.RETIRING,
+            workspace__projects__compose_stacks__id=deployment.stack.id,
+        ).aexists():
+            return
 
         await ComposeStackDeployment.objects.filter(
             hash=deployment.hash,

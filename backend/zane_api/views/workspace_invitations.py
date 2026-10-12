@@ -11,6 +11,7 @@ from rest_framework import status, permissions
 
 from .base import ResourceConflict, BadRequest
 from ..licensing.gate import can_add_user
+from ..retirement import get_active_retirement
 
 
 from ..models import WorkspaceMembership, WorkspaceInvitation, WorkspaceRole
@@ -155,6 +156,11 @@ class WorkspaceRegisterInvitationAPIView(APIView):
         except WorkspaceInvitation.DoesNotExist:
             raise exceptions.NotFound("This invitation link is invalid or has expired.")
 
+        if get_active_retirement(workspace=invitation.workspace) is not None:
+            raise ResourceConflict(
+                "This workspace is being retired and no longer accepts new members."
+            )
+
         if invitation.has_existing_account:
             raise BadRequest(
                 "This invitation is for an existing account. Please log in to accept it."
@@ -227,6 +233,11 @@ class WorkspaceReviewInvitationAPIView(APIView):
             )
         except WorkspaceInvitation.DoesNotExist:
             raise exceptions.NotFound("This invitation link is invalid or has expired.")
+
+        if get_active_retirement(workspace=invitation.workspace) is not None:
+            raise ResourceConflict(
+                "This workspace is being retired and no longer accepts new members."
+            )
 
         form = WorkspaceReviewInvitationRequestSerializer(data=request.data)
         form.is_valid(raise_exception=True)

@@ -730,3 +730,63 @@ class DockerBuildCachePruneResult:
     total_reclaimed: str = "0B"
     cache_entries: List[DockerBuildCacheEntry] = field(default_factory=list)
     error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Workspace retirement generation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorkspaceRetirementPayload:
+    generation: str
+
+
+@dataclass
+class RetirementTaskRef:
+    """Stable reference to one outbox cleanup unit of a generation."""
+
+    generation: str
+    unit_type: str
+    unit_key: str
+
+
+@dataclass
+class RetirementServiceUnit:
+    generation: str
+    # decoded as ArchivedDockerServiceDetails for both docker & git services
+    # (the JSON converter keeps the shared fields used by cleanup activities)
+    details: ArchivedDockerServiceDetails
+
+
+@dataclass
+class RetirementStackUnit:
+    generation: str
+    stack: ComposeStackArchiveDetails
+
+
+@dataclass
+class RetirementEnvironmentUnit:
+    generation: str
+    environment: EnvironmentDetails
+
+
+@dataclass
+class RetirementProjectUnit:
+    generation: str
+    project: ArchivedProjectDetails
+
+
+@dataclass
+class RetirementResourceConfirmation:
+    generation: str
+    unit_type: str
+    unit_key: str
+    resource_types: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RetirementReconcileResult:
+    redelivered: List[str] = field(default_factory=list)
+    finalized: List[str] = field(default_factory=list)
+    pending: List[str] = field(default_factory=list)

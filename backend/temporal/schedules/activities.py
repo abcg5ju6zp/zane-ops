@@ -28,7 +28,13 @@ with workflow.unsafe.imports_passed_through():
     import docker.errors
     from django import db
     from django.db.models import Q
-    from zane_api.models import Deployment, HealthCheck, ServiceMetrics, HttpLog
+    from zane_api.models import (
+        Deployment,
+        HealthCheck,
+        ServiceMetrics,
+        HttpLog,
+        WorkspaceRetirement,
+    )
     from zane_api.utils import (
         DockerSwarmTaskState,
         DockerSwarmTask,
@@ -134,6 +140,18 @@ class MonitorDockerDeploymentActivities:
                 return (
                     Deployment.DeploymentStatus.SLEEPING,
                     "Deployment is sleeping, skipping monitoring health check ",
+                )
+
+            # Generation guard: a late monitoring tick must never resurrect a
+            # deployment of a workspace that is being retired.
+            if await WorkspaceRetirement.objects.filter(
+                status=WorkspaceRetirement.RetirementStatus.RETIRING,
+                workspace__projects__services__deployments__hash=details.deployment.hash,
+            ).aexists():
+                raise ApplicationError(
+                    "Cannot run a monitoring healthcheck: its workspace is "
+                    "being retired in another generation.",
+                    non_retryable=True,
                 )
 
             healthcheck = details.healthcheck
@@ -306,6 +324,9 @@ class MonitorDockerDeploymentActivities:
                     Deployment.DeploymentStatus.REMOVED,
                 ]
             )
+            # never let a late health callback flip a retiring workspace's
+            # deployment back to a live state
+            & ~Q(service__project__workspace__retirement__isnull=False)
         ).aupdate(
             status_reason=healthcheck_result.reason,
             status=healthcheck_result.status,
@@ -610,7 +631,12 @@ class MonitorComposeStackActivites:
     async def save_stack_health_check_status(
         self, healthcheck: ComposeStackHealthcheckResult
     ):
-        await ComposeStack.objects.filter(pk=healthcheck.id).aupdate(
+        # Generation guard: a late stack health callback must not overwrite
+        # the status of a retiring workspace's compose stack.
+        await ComposeStack.objects.filter(
+            pk=healthcheck.id,
+            project__workspace__retirement__isnull=True,
+        ).aupdate(
             services={
                 name: service.to_dict()
                 for name, service in healthcheck.services.items()

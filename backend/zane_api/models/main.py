@@ -68,6 +68,7 @@ class Workspace(TimestampedModel):
         invitations: RelatedManager["WorkspaceInvitation"]
         memberships: RelatedManager["WorkspaceMembership"]
         owner: list["WorkspaceMembership"]
+        retirement: Optional["WorkspaceRetirement"]
 
     id = ShortUUIDField(
         length=11,
@@ -847,6 +848,9 @@ class Service(BaseService):
             .filter(environment_id=F("default_base_env_id"))
             .annotate(has_mismatch=Exists(mismatched_changes_subquery))
             .filter(has_mismatch=False)
+            # late webhook callbacks must never deploy / create previews in a
+            # workspace frozen by a retirement generation
+            .exclude(project__workspace__retirement__isnull=False)
             .select_related(
                 "project",
                 "healthcheck",
@@ -888,6 +892,8 @@ class Service(BaseService):
                     environment__preview_metadata__deploy_state=PreviewEnvMetadata.PreviewDeployState.APPROVED,
                 )
             )
+            # late webhook callbacks must never touch a retiring workspace
+            .exclude(project__workspace__retirement__isnull=False)
             .select_related(
                 "project",
                 "healthcheck",
@@ -968,6 +974,8 @@ class Service(BaseService):
                     environment__preview_metadata__source_trigger=Environment.PreviewSourceTrigger.PULL_REQUEST
                 )
             )
+            # late webhook callbacks must never redeploy in a retiring workspace
+            .exclude(project__workspace__retirement__isnull=False)
             .select_related(
                 "project",
                 "healthcheck",

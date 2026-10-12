@@ -31,6 +31,7 @@ with workflow.unsafe.imports_passed_through():
         Deployment,
         HealthCheck,
         DeploymentChange,
+        WorkspaceRetirement,
     )
     from docker.models.services import Service
     from urllib3.exceptions import HTTPError
@@ -715,6 +716,18 @@ class DockerSwarmActivities:
                 hash=healthcheck_result.deployment_hash
             ).select_related("service")
             deployment = await new_deployment_query.aget()
+
+            # Generation guard: a late deploy/health callback must never bring
+            # a resource back to HEALTHY while its workspace is retiring.
+            if await WorkspaceRetirement.objects.filter(
+                status=WorkspaceRetirement.RetirementStatus.RETIRING,
+                workspace__projects__services__deployments__hash=healthcheck_result.deployment_hash,
+            ).aexists():
+                raise ApplicationError(
+                    "Cannot save deployment status: its workspace is being "
+                    "retired in another generation.",
+                    non_retryable=True,
+                )
 
             deployment.status_reason = healthcheck_result.reason
             is_current_production = False

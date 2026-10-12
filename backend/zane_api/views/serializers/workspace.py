@@ -255,6 +255,22 @@ class WorkspaceTransferOwnershipRequestSerializer(serializers.Serializer):
     new_owner_id = serializers.IntegerField(min_value=1)
 
 
+class WorkspaceRetirementProgressSerializer(serializers.Serializer):
+    """Queryable progress of a workspace retirement generation."""
+
+    generation = serializers.UUIDField(read_only=True)
+    status = serializers.CharField(read_only=True)
+    delivery_status = serializers.CharField(read_only=True)
+    workflow_id = serializers.CharField(read_only=True)
+    created_at = serializers.DateTimeField(read_only=True)
+    started_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    finalized_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    snapshot = serializers.DictField(read_only=True)
+    progress = serializers.DictField(read_only=True)
+    units = serializers.DictField(read_only=True)
+    result = serializers.DictField(read_only=True, allow_null=True)
+
+
 class WorkspaceMembershipFilterSet(django_filters.FilterSet):
     role = django_filters.ChoiceFilter(choices=WorkspaceRole.choices)
     query = django_filters.CharFilter(method="filter_query")
