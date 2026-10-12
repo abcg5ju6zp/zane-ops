@@ -38,7 +38,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from search.loki_client import LokiSearchClient
     from search.dtos import RuntimeLogDto, RuntimeLogLevel, RuntimeLogSource
-    from container_registry.models import BuildRegistry
+    from container_registry.models import BuildRegistry, BuildRegistryGeneration
     from compose.models import ComposeStack, ComposeStackMetrics
     from compose.dtos import ComposeStackServiceStatusDto
     from docker.models.services import Service as DockerService
@@ -555,12 +555,29 @@ class MonitorRegistryDeploymentActivites:
             status=deployment_status,
             reason=deployment_status_reason,
             id=registry.id,
+            version=registry.version,
         )
 
     @activity.defn
     async def save_registry_health_check_status(
         self, healthcheck: RegistryHealthCheckResult
     ):
+        # Generation arbitration: results arriving late from an older
+        # generation (previous schedule arguments, retried update workflow)
+        # must never overwrite the state of the newest generation.
+        latest_version = (
+            await BuildRegistryGeneration.objects.filter(registry_id=healthcheck.id)
+            .order_by("-version")
+            .values_list("version", flat=True)
+            .afirst()
+        )
+        if latest_version is not None and healthcheck.version < latest_version:
+            print(
+                f"Dropping stale registry health result v{healthcheck.version} "
+                f"(latest generation is v{latest_version})"
+            )
+            return
+
         await BuildRegistry.objects.filter(pk=healthcheck.id).aupdate(
             health_status=healthcheck.status,
             healthcheck_message=healthcheck.reason or "",

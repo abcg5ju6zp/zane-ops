@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Literal, Optional, TYPE_CHECKING, cast
+from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING, cast
 import yaml
 
 
@@ -561,6 +561,56 @@ class RegistryConfig:
         return yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False)
 
 
+def build_registry_storage_config(
+    storage_backend: str,
+    s3_credentials: Optional[dict],
+) -> "RegistryConfig.StorageConfig":
+    fs_config = None
+    if storage_backend == "LOCAL":
+        fs_config = RegistryConfig.StorageConfig.Filesystem()
+
+    s3_config = None
+    if storage_backend == "S3" and s3_credentials is not None:
+        s3_config = RegistryConfig.StorageConfig.S3(
+            bucket=s3_credentials["bucket"],
+            accesskey=s3_credentials["access_key"],
+            secretkey=s3_credentials["secret_key"],
+            region=s3_credentials["region"],
+            regionendpoint=s3_credentials.get("endpoint"),
+        )
+
+    return RegistryConfig.StorageConfig(filesystem=fs_config, s3=s3_config)
+
+
+def registry_snapshot_from_generation(generation: Any) -> "RegistrySnaphot":
+    """
+    Build the serializable workflow snapshot from an immutable
+    BuildRegistryGeneration row. The model is imported lazily so that this
+    module stays importable from Temporal workflow sandboxes.
+    """
+    snap = generation.snapshot
+    return RegistrySnaphot(
+        id=str(generation.registry_id),
+        generation_id=str(generation.id),
+        name=snap["name"],
+        config=RegistryConfig(
+            storage=build_registry_storage_config(
+                snap["storage_backend"],
+                snap.get("s3_credentials"),
+            )
+        ),
+        domain=snap["registry_domain"],
+        username=snap["registry_username"],
+        password=snap["registry_password"],
+        version=snap["version"],
+        service_alias=snap["service_alias"],
+        swarm_service_name=snap["swarm_service_name"],
+        is_secure=snap["is_secure"],
+        monitor_schedule_id=snap.get("monitor_schedule_id")
+        or f"monitor-{generation.registry_id}",
+    )
+
+
 @dataclass
 class RegistrySnaphot:
     id: str
@@ -574,15 +624,19 @@ class RegistrySnaphot:
     swarm_service_name: str
     is_secure: bool
     monitor_schedule_id: str
+    generation_id: Optional[str] = None
 
 
 @dataclass
-class UpdateRegistryPayload:
-    service_alias: str
-    swarm_service_name: str
-    id: str
-    previous: RegistrySnaphot
-    current: RegistrySnaphot
+class BuildRegistryGenerationPayload:
+    generation_id: str
+    target: RegistrySnaphot
+
+
+@dataclass
+class RegistryGenerationStageDetails:
+    generation_id: str
+    stage: str
 
 
 @dataclass
@@ -597,6 +651,7 @@ class SwarmRegistryServiceDetails:
     configs: dict[str, ConfigDto]
     registry: RegistrySnaphot
     volume: Optional[VolumeDto] = None
+    generation_id: Optional[str] = None
 
 
 @dataclass
@@ -618,6 +673,7 @@ class RegistryHealthCheckResult:
     id: str
     status: str
     reason: Optional[str] = None
+    version: int = 0
 
 
 @dataclass

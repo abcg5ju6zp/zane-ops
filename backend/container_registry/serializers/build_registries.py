@@ -1,10 +1,13 @@
 from typing import cast
 from rest_framework import serializers
 
-from ..models import BuildRegistry
+from ..models import BuildRegistry, BuildRegistryGeneration
 from temporal.workflows import DeployBuildRegistryWorkflow, UpdateBuildRegistryWorkflow
 from temporal.client import TemporalClient
-from temporal.shared import RegistryConfig, RegistrySnaphot, UpdateRegistryPayload
+from temporal.shared import (
+    BuildRegistryGenerationPayload,
+    registry_snapshot_from_generation,
+)
 from django.db import transaction
 import secrets
 from django.db.models import Q, F, Value
@@ -238,49 +241,24 @@ class BuildRegistryListCreateSerializer(serializers.ModelSerializer):
         )
         registry.save()
 
+        # The first immutable, queryable generation; it is published as active
+        # only once the workflow confirms Swarm, proxy and health scheduling.
+        generation = BuildRegistryGeneration.objects.create(
+            registry=registry,
+            version=registry.version,
+            snapshot=BuildRegistryGeneration.snapshot_from_registry(registry),
+        )
+
         def commit_callback():
-            fs_config = None
-            if registry.storage_backend == BuildRegistry.StorageBackend.LOCAL:
-                fs_config = RegistryConfig.StorageConfig.Filesystem()
-
-            s3_config = None
-            if (
-                registry.storage_backend == BuildRegistry.StorageBackend.S3
-                and registry.s3_credentials is not None
-            ):
-                credentials = cast(dict, registry.s3_credentials)
-                s3_config = RegistryConfig.StorageConfig.S3(
-                    bucket=credentials["bucket"],
-                    accesskey=credentials["access_key"],
-                    secretkey=credentials["secret_key"],
-                    region=credentials["region"],
-                    regionendpoint=credentials["endpoint"],
-                )
-
-            config = RegistryConfig(
-                storage=RegistryConfig.StorageConfig(
-                    filesystem=fs_config,
-                    s3=s3_config,
-                )
-            )
-            payload = RegistrySnaphot(
-                service_alias=cast(str, registry.service_alias),
-                config=config,
-                swarm_service_name=cast(str, registry.swarm_service_name),
-                name=registry.name,
-                id=registry.id,
-                domain=registry.registry_domain,
-                username=registry.registry_username,
-                password=registry.registry_password,
-                version=registry.version,
-                is_secure=registry.is_secure,
-                monitor_schedule_id=registry.monitor_schedule_id,
+            payload = BuildRegistryGenerationPayload(
+                generation_id=generation.id,
+                target=registry_snapshot_from_generation(generation),
             )
 
             TemporalClient.start_workflow(
                 workflow=DeployBuildRegistryWorkflow.run,
                 arg=payload,
-                id=registry.workflow_id,
+                id=generation.workflow_id,
             )
 
         transaction.on_commit(commit_callback)
@@ -407,87 +385,75 @@ class BuildRegistryUpdateDetailsSerializer(serializers.ModelSerializer):
         if is_default:
             BuildRegistry.objects.exclude(id=instance.id).update(is_default=False)
 
-        BuildRegistry.objects.filter(pk=instance.id).update(
-            version=F("version") + Value(1),
-            registry_domain=registry_domain,
-            name=name,
-            is_default=is_default,
-            is_secure=is_secure,
-            registry_username=registry_username,
-            registry_password=registry_password,
-            storage_backend=storage_backend,
-            s3_credentials=s3_credentials,
-        )
-
-        def get_storage_config(storage_backend: str, s3_credentials: dict | None):
-            fs_config = None
-            if storage_backend == BuildRegistry.StorageBackend.LOCAL:
-                fs_config = RegistryConfig.StorageConfig.Filesystem()
-
-            s3_config = None
-            if (
-                storage_backend == BuildRegistry.StorageBackend.S3
-                and s3_credentials is not None
-            ):
-                s3_config = RegistryConfig.StorageConfig.S3(
-                    bucket=s3_credentials["bucket"],
-                    accesskey=s3_credentials["access_key"],
-                    secretkey=s3_credentials["secret_key"],
-                    region=s3_credentials["region"],
-                    regionendpoint=s3_credentials["endpoint"],
-                )
-            return RegistryConfig.StorageConfig(filesystem=fs_config, s3=s3_config)
-
-        previous_snapshot = RegistrySnaphot(
-            service_alias=cast(str, instance.service_alias),
-            swarm_service_name=cast(str, instance.swarm_service_name),
-            id=instance.id,
-            config=RegistryConfig(
-                storage=get_storage_config(
-                    instance.storage_backend,
-                    instance.s3_credentials,
-                )
-            ),
-            name=instance.name,
-            domain=instance.registry_domain,
-            username=instance.registry_username,
-            password=instance.registry_password,
-            version=instance.version,
-            is_secure=instance.is_secure,
-            monitor_schedule_id=instance.monitor_schedule_id,
-        )
-        new_snapshot = RegistrySnaphot(
-            service_alias=cast(str, instance.service_alias),
-            swarm_service_name=cast(str, instance.swarm_service_name),
-            id=instance.id,
-            config=RegistryConfig(
-                storage=get_storage_config(
-                    storage_backend,
-                    s3_credentials,
-                )
-            ),
-            name=name,
-            domain=registry_domain,
-            username=registry_username,
-            password=registry_password,
+        overrides = {
+            "name": name,
+            "registry_domain": registry_domain,
+            "registry_username": registry_username,
+            "registry_password": registry_password,
+            "is_secure": is_secure,
+            "storage_backend": storage_backend,
+            "s3_credentials": s3_credentials,
+        }
+        target_snapshot = BuildRegistryGeneration.snapshot_from_registry(
+            instance,
             version=instance.version + 1,
-            is_secure=is_secure,
-            monitor_schedule_id=instance.monitor_schedule_id,
+            overrides=overrides,
         )
+        latest_generation = (
+            instance.generations.order_by("-version").first()
+            if instance.pk is not None
+            else None
+        )
+        is_retry = (
+            latest_generation is not None
+            and latest_generation.status
+            == BuildRegistryGeneration.GenerationStatus.STAGING
+            and all(
+                latest_generation.snapshot.get(field) == target_snapshot[field]
+                for field in BuildRegistryGeneration.DEPLOYMENT_FIELDS
+            )
+        )
+
+        if is_retry:
+            # The previous request only partially applied: continue the same
+            # generation, never increment the version a second time and never
+            # prepare a parallel set of staging resources.
+            generation = cast(BuildRegistryGeneration, latest_generation)
+            BuildRegistry.objects.filter(pk=instance.id).update(
+                name=name,
+                is_default=is_default,
+            )
+        else:
+            # New distinct change (or an update while no change is in flight):
+            # bump the version and persist the immutable target snapshot of the
+            # new generation before external resources are touched.
+            BuildRegistry.objects.filter(pk=instance.id).update(
+                version=F("version") + Value(1),
+                registry_domain=registry_domain,
+                name=name,
+                is_default=is_default,
+                is_secure=is_secure,
+                registry_username=registry_username,
+                registry_password=registry_password,
+                storage_backend=storage_backend,
+                s3_credentials=s3_credentials,
+            )
+            generation = BuildRegistryGeneration.objects.create(
+                registry=instance,
+                version=instance.version + 1,
+                snapshot=target_snapshot,
+            )
 
         def commit_callback():
-            payload = UpdateRegistryPayload(
-                service_alias=cast(str, instance.service_alias),
-                swarm_service_name=cast(str, instance.swarm_service_name),
-                id=instance.id,
-                previous=previous_snapshot,
-                current=new_snapshot,
+            payload = BuildRegistryGenerationPayload(
+                generation_id=generation.id,
+                target=registry_snapshot_from_generation(generation),
             )
 
             TemporalClient.start_workflow(
                 workflow=UpdateBuildRegistryWorkflow.run,
                 arg=payload,
-                id=instance.workflow_id,
+                id=generation.workflow_id,
             )
 
         transaction.on_commit(commit_callback)

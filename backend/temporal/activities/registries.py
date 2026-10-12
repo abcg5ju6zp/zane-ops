@@ -1,14 +1,18 @@
 import asyncio
 from datetime import timedelta
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from temporalio import activity, workflow
 from temporalio.exceptions import ApplicationError
-from temporalio.client import ScheduleAlreadyRunningError
 from temporalio.service import RPCError
 
 with workflow.unsafe.imports_passed_through():
     import docker
     import docker.errors
+    import requests
+    from asgiref.sync import sync_to_async
+    from django.conf import settings
+    from django.db import transaction
+    from django.utils import timezone
     from zane_api.utils import Colors
     from zane_api.dtos import VolumeDto, ConfigDto
     from docker.types import (
@@ -19,12 +23,14 @@ with workflow.unsafe.imports_passed_through():
         Healthcheck,
         Mount,
     )
-    from django.conf import settings
     from ..helpers import get_docker_client
-    from ..proxy import ZaneProxyClient
+    from ..proxy import ZaneProxyClient, ZaneProxyEtagError
     from ..semaphore import AsyncSemaphore
     from ..schedules import MonitorRegistrySwarmServiceWorkflow
-    from container_registry.models import BuildRegistry
+    from container_registry.models import (
+        BuildRegistry,
+        BuildRegistryGeneration,
+    )
 
 from ..client import TemporalClient
 
@@ -35,6 +41,7 @@ from ..shared import (
     CreateBuildRegistryConfigsDetails,
     RegistrySnaphot,
     RegistryHealthCheckResult,
+    RegistryGenerationStageDetails,
 )
 from ..constants import (
     BUILD_REGISTRY_VOLUME_PATH,
@@ -47,17 +54,30 @@ import platform
 from zane_api.utils import DockerSwarmTask, DockerSwarmTaskState, find_item_in_sequence
 
 
+# Maximum number of polls waiting for a swarm task to converge to a target
+# version. Each poll waits DEFAULT_HEALTHCHECK_WAIT_INTERVAL seconds (time is
+# skipped instantly in the Temporal test environment).
+MAX_SWARM_CONVERGENCE_POLLS = 60
+
+# Maps a workflow stage to the persisted timestamp on the generation row.
+STAGE_FIELDS = {
+    "staged": "staged_at",
+    "swarm": "swarm_confirmed_at",
+    "proxy": "proxy_confirmed_at",
+    "schedule": "schedule_confirmed_at",
+    "published": "published_at",
+    "cleaned": "cleaned_at",
+}
+
+
 class SimpleRegistryPayloadLike(Protocol):
     @property
     def swarm_service_name(self) -> str: ...
 
 
 class DeployRegistryPayloadLike(Protocol):
-    @property
-    def swarm_service_name(self) -> str: ...
-
-    @property
-    def version(self) -> int: ...
+    swarm_service_name: str
+    version: int
 
 
 def get_resource_labels(details: SimpleRegistryPayloadLike, **kwargs: str):
@@ -66,15 +86,70 @@ def get_resource_labels(details: SimpleRegistryPayloadLike, **kwargs: str):
 
 def get_volume_name_for_registry(
     details: DeployRegistryPayloadLike,
-):
+) -> str:
     return f"vol-{details.swarm_service_name}"
+
+
+def get_config_version_name(
+    swarm_service_name: str,
+    version: int,
+    type: Literal["config", "credentials"],
+):
+    return f"cfg-{swarm_service_name}-{type}-v{version}"
 
 
 def get_config_name_for_registry(
     details: DeployRegistryPayloadLike,
     type: Literal["config", "credentials"],
 ):
-    return f"cfg-{details.swarm_service_name}-{type}-v{details.version}"
+    return get_config_version_name(details.swarm_service_name, details.version, type)
+
+
+async def _aget_generation(
+    generation_id: str,
+) -> BuildRegistryGeneration:
+    """
+    Return the generation or fail non-retryably when it is gone. A missing
+    generation means the registry was deleted or the request belongs to an
+    aborted change: external resources must never be (re)created in that case.
+    """
+    try:
+        return await BuildRegistryGeneration.objects.aget(pk=generation_id)
+    except BuildRegistryGeneration.DoesNotExist:
+        raise ApplicationError(
+            f"Build registry generation `{generation_id}` does not exist anymore, "
+            "aborting the workflow without touching external resources.",
+            non_retryable=True,
+        )
+
+
+async def _assert_generation_exists(generation_id: str | None):
+    if generation_id is not None:
+        await _aget_generation(generation_id)
+
+
+def _newest_running_task(swarm_service: Any):
+    tasks = swarm_service.tasks(filters={"desired-state": "running"})
+    if len(tasks) == 0:
+        return None
+    return DockerSwarmTask.from_dict(
+        max(tasks, key=lambda task: task["Version"]["Index"])
+    )
+
+
+def _get_task_version(task: Any) -> str | None:
+    env_var = find_item_in_sequence(
+        lambda env: env.startswith("__ZANE_VERSION="),
+        task.Spec.ContainerSpec.Env,
+    )
+    if env_var is None:
+        return None
+    return cast(str, env_var).split("=", 1)[1]
+
+
+def _get_service_spec_version(swarm_service: Any) -> str | None:
+    labels = swarm_service.attrs.get("Spec", {}).get("Labels", {}) or {}
+    return labels.get("version")
 
 
 @activity.defn
@@ -102,7 +177,23 @@ async def release_registry_deploy_semaphore(registry_id: str):
 
 
 @activity.defn
+async def get_registry_generation_status(generation_id: str) -> str:
+    generation = await _aget_generation(generation_id)
+    return cast(str, generation.status)
+
+
+@activity.defn
+async def mark_registry_generation_stage(details: RegistryGenerationStageDetails):
+    generation = await _aget_generation(details.generation_id)
+    field = STAGE_FIELDS[details.stage]
+    if getattr(generation, field) is None:
+        setattr(generation, field, timezone.now())
+        await generation.asave(update_fields=[field])
+
+
+@activity.defn
 async def create_docker_volume_for_registry(payload: RegistrySnaphot):
+    await _assert_generation_exists(payload.generation_id)
     client = get_docker_client()
     print(
         f"Creating docker volume for registry {Colors.ORANGE}{payload.name}{Colors.ENDC}..."
@@ -157,6 +248,9 @@ async def create_docker_configs_for_registry(
 ) -> CreateBuildRegistryConfigsDetails:
     import bcrypt
 
+    # The configs carry the target generation version in their stable identity:
+    # staging a new generation never touches the resources of the active one.
+    await _assert_generation_exists(payload.generation_id)
     client = get_docker_client()
     print(
         f"Creating docker swarm configs for registry {Colors.ORANGE}{payload.name}{Colors.ENDC}..."
@@ -208,34 +302,66 @@ async def create_docker_configs_for_registry(
 
 
 @activity.defn
-async def delete_previous_docker_configs_for_registry(
-    registry: RegistrySnaphot,
-):
+async def cleanup_superseded_registry_configs(generation_id: str):
+    """
+    Reference-based reaping: remove the versioned docker configs of every
+    SUPERSEDED generation whose version is strictly below the version currently
+    published on the registry. Configs still referenced by the active service
+    or by an in-flight generation are never deleted.
+    """
+    generation = await _aget_generation(generation_id)
+    try:
+        registry = await BuildRegistry.objects.aget(pk=generation.registry_id)
+    except BuildRegistry.DoesNotExist:
+        raise ApplicationError(
+            f"Build registry `{generation.registry_id}` does not exist anymore, "
+            "the destroy workflow owns resource cleanup.",
+            non_retryable=True,
+        )
+
     client = get_docker_client()
-    print(
-        f"Deleting previous configs for registry {Colors.ORANGE}{registry.swarm_service_name}(v{registry.version}){Colors.ENDC}..."
-    )
+    superseded_generations = [
+        gen
+        async for gen in BuildRegistryGeneration.objects.filter(
+            registry_id=registry.id,
+            status=BuildRegistryGeneration.GenerationStatus.SUPERSEDED,
+        ).order_by("version")
+    ]
 
-    configFileId = get_config_name_for_registry(registry, type="config")
-    credentialsFileId = get_config_name_for_registry(registry, type="credentials")
+    for old_generation in superseded_generations:
+        if old_generation.version >= registry.version:
+            # reference guard: a live (or newer in-flight) service may still
+            # reference these configs
+            continue
+        if old_generation.cleaned_at is not None:
+            continue
 
-    try:
-        config = client.configs.get(configFileId)
-    except docker.errors.NotFound:
-        pass  # the config has probably been deleted
-    else:
-        config.remove()
+        all_removed = True
+        config_types: list[Literal["config", "credentials"]] = [
+            "config",
+            "credentials",
+        ]
+        for type in config_types:
+            config_name = get_config_version_name(
+                cast(str, registry.swarm_service_name),
+                old_generation.version,
+                type,
+            )
+            try:
+                config = client.configs.get(config_name)
+            except docker.errors.NotFound:
+                continue
+            try:
+                config.remove()
+                print(f"Deleted superseded swarm config `{config_name}` ✅")
+            except docker.errors.APIError:
+                # The config is likely still attached to a converging swarm
+                # task; leave it for a later generation's cleanup.
+                all_removed = False
 
-    try:
-        config = client.configs.get(credentialsFileId)
-    except docker.errors.NotFound:
-        pass  # the config has probably been deleted
-    else:
-        config.remove()
-
-    print(
-        f"Succesfully deleted the Swarm Configs for registry {Colors.ORANGE}{registry.swarm_service_name}(v{registry.version}){Colors.ENDC}  ✅",
-    )
+        if all_removed:
+            old_generation.cleaned_at = timezone.now()
+            await old_generation.asave(update_fields=["cleaned_at"])
 
 
 @activity.defn
@@ -310,112 +436,198 @@ async def cleanup_docker_registry_service_resources(
 
 @activity.defn
 async def upsert_registry_url_in_proxy(payload: RegistrySnaphot):
-    ZaneProxyClient.upsert_registry_url(
-        registry_id=payload.id,
-        registry_alias=payload.service_alias,
-        domain=payload.domain,
-        is_secure=payload.is_secure,
+    # The proxy stage is independently recoverable: when the write response is
+    # uncertain, we verify the actual route and only redo the write if the
+    # target domain is not already served for the service alias.
+    await _assert_generation_exists(payload.generation_id)
+    alias = payload.service_alias
+
+    def route_is_up_to_date(route) -> bool:
+        return ZaneProxyClient.is_build_registry_route_up_to_date(
+            route,
+            alias,
+            payload.domain,
+        )
+
+    try:
+        current_route = ZaneProxyClient.get_build_registry_route(alias)
+        if route_is_up_to_date(current_route):
+            print(f"Proxy route already up to date for {alias}, skipping upsert.")
+            return
+        ZaneProxyClient.upsert_registry_url(
+            registry_id=payload.id,
+            registry_alias=alias,
+            domain=payload.domain,
+            is_secure=payload.is_secure,
+        )
+    except (requests.RequestException, ZaneProxyEtagError) as error:
+        print(f"Uncertain proxy response for {alias}: {error}, reconciling...")
+        try:
+            actual_route = ZaneProxyClient.get_build_registry_route(alias)
+        except requests.RequestException:
+            raise ApplicationError(
+                f"Proxy route state could not be confirmed: {error}"
+            )
+        if route_is_up_to_date(actual_route):
+            return
+        raise ApplicationError(f"Proxy route update was not confirmed: {error}")
+
+
+def _update_swarm_service_spec(
+    swarm_service: Any, service: SwarmRegistryServiceDetails
+):
+    client = get_docker_client()
+    # Volumes
+    mounts: list[Mount] = []
+    if service.volume is not None:
+        mounts.append(
+            Mount(
+                target=service.volume.container_path,
+                source=service.volume.id,
+                type="volume",
+            )
+        )
+
+    # configs
+    configs: list[ConfigReference] = []
+    docker_config_list = client.configs.list(
+        filters={
+            "label": [
+                f"{key}={value}"
+                for key, value in get_resource_labels(service.registry).items()
+            ]
+        }
+    )
+    for config in docker_config_list:
+        config_id = cast(str, config.id)
+        # only attach the target generation's configs, never previous versions
+        existing = service.configs.get(config.name)
+        if existing is not None:
+            configs.append(
+                ConfigReference(
+                    config_id=config_id,
+                    config_name=config.name,
+                    filename=service.configs[config.name].mount_path,
+                )
+            )
+
+    print(
+        f"Updating swarm service for registry {Colors.ORANGE}{service.registry.name}{Colors.ENDC}..."
+    )
+    swarm_service.update(
+        image=BUILD_REGISTRY_IMAGE,
+        mounts=mounts,
+        labels=get_resource_labels(
+            service.registry,
+            type="registry",
+            version=str(service.registry.version),
+            status="active",
+        ),
+        env=[
+            f"__ZANE_VERSION={service.registry.version}",
+            "OTEL_TRACES_EXPORTER=none",
+        ],
+        networks=[
+            NetworkAttachmentConfig(
+                target="zane",
+                aliases=[
+                    cast(str, service.alias),
+                    cast(str, service.alias).replace(
+                        f".{settings.ZANE_INTERNAL_DOMAIN}", ""
+                    ),
+                ],
+            ),
+        ],
+        update_config=UpdateConfig(
+            order="start-first",
+            parallelism=1,
+        ),
+        restart_policy=RestartPolicy(
+            condition="any",
+        ),
+        healthcheck=Healthcheck(
+            test=[
+                "CMD",
+                "wget",
+                "--quiet",
+                "--tries=1",
+                "--spider",
+                "http://localhost:5001/debug/health",
+            ],
+            # times are in nanoseconds, that's why they are mutiplied by `e9` (1 billion)
+            interval=int(10e9),
+            timeout=int(5e9),
+            retries=3,
+            start_period=int(5e9),
+        ),
+        stop_grace_period=int(30e9),
+        configs=configs,
+    )
+    print(
+        f"Succesfully updated swarm service for the registry {Colors.ORANGE}{service.registry.name}{Colors.ENDC} ✅",
     )
 
 
 @activity.defn
-async def update_build_registry_swarm_service(
+async def reconcile_build_registry_swarm_service(
     service: SwarmRegistryServiceDetails,
 ):
+    """
+    Reconcile the swarm service against the target generation version:
+      * if a running task already serves the target version, nothing is done;
+      * if the target spec was already applied (task still converging after an
+        uncertain response), the update is NOT issued a second time;
+      * otherwise the service is updated exactly once.
+    """
+    await _assert_generation_exists(service.generation_id)
     client = get_docker_client()
+    target_version = str(service.registry.version)
+
     try:
         swarm_service = client.services.get(service.swarm_id)
     except docker.errors.NotFound:
         raise ApplicationError("This registry has not been deployed yet")
-    else:
-        # Volumes
-        mounts: list[Mount] = []
-        if service.volume is not None:
-            mounts.append(
-                Mount(
-                    target=service.volume.container_path,
-                    source=service.volume.id,
-                    type="volume",
-                )
+
+    def running_task_is_at_target() -> bool:
+        task = _newest_running_task(swarm_service)
+        if task is None:
+            return False
+        return (
+            task.state == DockerSwarmTaskState.RUNNING
+            and _get_task_version(task) == target_version
+        )
+
+    if running_task_is_at_target():
+        print(
+            f"Swarm service `{service.swarm_id}` already runs v{target_version}, "
+            "skipping update."
+        )
+        return
+
+    if _get_service_spec_version(swarm_service) == target_version:
+        print(
+            f"Swarm service `{service.swarm_id}` already targets v{target_version}, "
+            "waiting for the task to converge without re-issuing the update."
+        )
+        return
+
+    try:
+        _update_swarm_service_spec(swarm_service, service)
+    except docker.errors.APIError as error:
+        # The update response is uncertain: verify the real service state and
+        # only proceed when the target version is confirmed.
+        print(f"Uncertain swarm update response: {error}, reconciling...")
+        try:
+            refreshed_service = client.services.get(service.swarm_id)
+        except docker.errors.NotFound:
+            raise ApplicationError(
+                f"Swarm service disappeared after an uncertain update: {error}"
             )
-
-        # configs
-        configs: list[ConfigReference] = []
-        docker_config_list = client.configs.list(
-            filters={
-                "label": [
-                    f"{key}={value}"
-                    for key, value in get_resource_labels(service.registry).items()
-                ]
-            }
-        )
-        for config in docker_config_list:
-            config_id = cast(str, config.id)
-            # do not include previous configs
-            existing = service.configs.get(config.name)
-            if existing is not None:
-                configs.append(
-                    ConfigReference(
-                        config_id=config_id,
-                        config_name=config.name,
-                        filename=service.configs[config.name].mount_path,
-                    )
-                )
-
-        print(
-            f"Updating swarm service for registry {Colors.ORANGE}{service.registry.name}{Colors.ENDC}..."
-        )
-        swarm_service.update(
-            image=BUILD_REGISTRY_IMAGE,
-            mounts=mounts,
-            labels=get_resource_labels(
-                service.registry,
-                type="registry",
-                version=str(service.registry.version),
-                status="active",
-            ),
-            env=[
-                f"__ZANE_VERSION={service.registry.version}",
-                "OTEL_TRACES_EXPORTER=none",
-            ],
-            networks=[
-                NetworkAttachmentConfig(
-                    target="zane",
-                    aliases=[
-                        cast(str, service.alias),
-                        cast(str, service.alias).replace(
-                            f".{settings.ZANE_INTERNAL_DOMAIN}", ""
-                        ),
-                    ],
-                ),
-            ],
-            update_config=UpdateConfig(
-                order="start-first",
-                parallelism=1,
-            ),
-            restart_policy=RestartPolicy(
-                condition="any",
-            ),
-            healthcheck=Healthcheck(
-                test=[
-                    "CMD",
-                    "wget",
-                    "--quiet",
-                    "--tries=1",
-                    "--spider",
-                    "http://localhost:5001/debug/health",
-                ],
-                # times are in nanoseconds, that's why they are mutiplied by `e9` (1 billion)
-                interval=int(10e9),
-                timeout=int(5e9),
-                retries=3,
-                start_period=int(5e9),
-            ),
-            stop_grace_period=int(30e9),
-            configs=configs,
-        )
-        print(
-            f"Succesfully updated swarm service for the registry {Colors.ORANGE}{service.registry.name}{Colors.ENDC} ✅",
+        if _get_service_spec_version(refreshed_service) == target_version:
+            print("Reconciliation confirmed the target spec was applied.")
+            return
+        raise ApplicationError(
+            f"Swarm service update to v{target_version} is not confirmed: {error}"
         )
 
 
@@ -423,65 +635,56 @@ async def update_build_registry_swarm_service(
 async def wait_for_registry_service_to_be_updated(
     payload: RegistrySnaphot,
 ) -> RegistryHealthCheckResult:
+    await _assert_generation_exists(payload.generation_id)
     client = get_docker_client()
+    target_version = str(payload.version)
 
-    try:
-        swarm_service = client.services.get(payload.swarm_service_name)
-    except docker.errors.NotFound:
-        raise ApplicationError("This registry has not been deployed yet")
-    except BuildRegistry.DoesNotExist:
-        raise ApplicationError("Cannot deploy a non existing registry")
-    else:
-        print(f"waiting for service {swarm_service.name=} to be updated...")
+    print(f"waiting for service {payload.swarm_service_name=} to run v{target_version}...")
+    for _ in range(MAX_SWARM_CONVERGENCE_POLLS):
+        try:
+            swarm_service = client.services.get(payload.swarm_service_name)
+        except docker.errors.NotFound:
+            raise ApplicationError("This registry has not been deployed yet")
 
-        current_service_task = DockerSwarmTask.from_dict(
-            max(
-                swarm_service.tasks(filters={"desired-state": "running"}),
-                key=lambda task: task["Version"]["Index"],
-            )
+        current_service_task = _newest_running_task(swarm_service)
+        current_version = (
+            _get_task_version(current_service_task)
+            if current_service_task is not None
+            else None
         )
 
-        current_version_env = find_item_in_sequence(
-            lambda env: env.startswith("__ZANE_VERSION"),
-            current_service_task.Spec.ContainerSpec.Env,
-        )
-
-        _, current_version = cast(str, current_version_env).split("=")
-
-        while (
-            current_service_task.state != DockerSwarmTaskState.RUNNING
-            and current_version != str(payload.version)
+        if (
+            current_service_task is not None
+            and current_service_task.state == DockerSwarmTaskState.RUNNING
+            and current_version == target_version
         ):
             print(
-                f"service {swarm_service.name=} is not updated yet, "
-                + f"retrying in {settings.DEFAULT_HEALTHCHECK_WAIT_INTERVAL} seconds..."
+                f"service {swarm_service.name=} runs v{target_version}, YAY !! 🎉"
             )
-            await asyncio.sleep(settings.DEFAULT_HEALTHCHECK_WAIT_INTERVAL)
+            return RegistryHealthCheckResult(
+                id=payload.id,
+                version=payload.version,
+                status=BuildRegistry.RegistryHealthStatus.HEALTHY,
+                reason="Service updated successfully",
+            )
 
-            current_service_task = DockerSwarmTask.from_dict(
-                max(
-                    swarm_service.tasks(filters={"desired-state": "running"}),
-                    key=lambda task: task["Version"]["Index"],
-                )
-            )
-            current_version_env = find_item_in_sequence(
-                lambda env: env.startswith("__ZANE_VERSION"),
-                current_service_task.Spec.ContainerSpec.Env,
-            )
-            _, current_version = cast(str, current_version_env).split("=")
-
-        print(f"service {swarm_service.name=} is updated, YAY !! 🎉")
-        return RegistryHealthCheckResult(
-            id=payload.id,
-            status=BuildRegistry.RegistryHealthStatus.HEALTHY,
-            reason="Service updated successfully",
+        print(
+            f"service {swarm_service.name=} is not at v{target_version} yet "
+            f"(running v{current_version}), retrying in "
+            f"{settings.DEFAULT_HEALTHCHECK_WAIT_INTERVAL} seconds..."
         )
+        await asyncio.sleep(settings.DEFAULT_HEALTHCHECK_WAIT_INTERVAL)
+
+    raise ApplicationError(
+        f"Timed out waiting for the swarm service to run v{target_version}"
+    )
 
 
 @activity.defn
 async def create_build_registry_swarm_service(
     service: SwarmRegistryServiceDetails,
 ):
+    await _assert_generation_exists(service.generation_id)
     client = get_docker_client()
 
     try:
@@ -576,18 +779,20 @@ async def create_build_registry_swarm_service(
 
 
 @activity.defn
-async def create_registry_health_check_schedule(registry: RegistrySnaphot):
-    try:
-        await TemporalClient.acreate_schedule(
-            workflow=MonitorRegistrySwarmServiceWorkflow.run,
-            args=registry,
-            id=registry.monitor_schedule_id,
-            interval=timedelta(seconds=30),
-            task_queue=settings.TEMPORALIO_SCHEDULE_TASK_QUEUE,
-        )
-    except ScheduleAlreadyRunningError:
-        # because the schedule already exists and is running, we can ignore it
-        pass
+async def ensure_registry_health_check_schedule(registry: RegistrySnaphot):
+    """
+    Create or update the monitoring schedule so that scheduled runs always
+    carry the current generation snapshot. Independently recoverable: upsert
+    is idempotent and a failure here does not roll back swarm/proxy stages.
+    """
+    await _assert_generation_exists(registry.generation_id)
+    await TemporalClient.aupsert_schedule(
+        workflow=MonitorRegistrySwarmServiceWorkflow.run,
+        args=registry,
+        id=registry.monitor_schedule_id,
+        interval=timedelta(seconds=30),
+        task_queue=settings.TEMPORALIO_SCHEDULE_TASK_QUEUE,
+    )
 
 
 @activity.defn
@@ -599,3 +804,105 @@ async def delete_registry_health_check_schedule(
     except RPCError:
         # Probably already deleted
         pass
+
+
+def _publish_registry_generation_sync(generation_id: str) -> str:
+    """
+    Publish a staging generation as the active one.
+
+    The publication is the single arbitration point: an older generation whose
+    version is behind the live registry version (concurrent modification,
+    retried outdated workflow) is marked SUPERSEDED without overwriting
+    anything. Swarm/proxy/schedule confirmations are required beforehand.
+    """
+    with transaction.atomic():
+        try:
+            generation = BuildRegistryGeneration.objects.select_for_update().get(
+                pk=generation_id
+            )
+        except BuildRegistryGeneration.DoesNotExist:
+            raise ApplicationError(
+                f"Build registry generation `{generation_id}` does not exist anymore.",
+                non_retryable=True,
+            )
+
+        try:
+            registry = BuildRegistry.objects.select_for_update().get(
+                pk=generation.registry_id
+            )
+        except BuildRegistry.DoesNotExist:
+            raise ApplicationError(
+                f"Build registry `{generation.registry_id}` does not exist anymore.",
+                non_retryable=True,
+            )
+
+        active = BuildRegistryGeneration.GenerationStatus.ACTIVE
+        superseded = BuildRegistryGeneration.GenerationStatus.SUPERSEDED
+
+        if generation.status == active:
+            return cast(str, active)
+
+        # A newer generation is already live (concurrent edits / late workflow).
+        if registry.version > generation.version:
+            generation.status = superseded
+            generation.save(update_fields=["status"])
+            return cast(str, superseded)
+
+        snapshot = generation.snapshot
+        snapshot_mismatch = any(
+            getattr(registry, field) != snapshot.get(field)
+            for field in BuildRegistryGeneration.DEPLOYMENT_FIELDS
+        )
+        if snapshot_mismatch:
+            generation.status = superseded
+            generation.save(update_fields=["status"])
+            return cast(str, superseded)
+
+        unconfirmed_stages = [
+            stage
+            for stage, field in (
+                ("staged", "staged_at"),
+                ("swarm", "swarm_confirmed_at"),
+                ("proxy", "proxy_confirmed_at"),
+                ("schedule", "schedule_confirmed_at"),
+            )
+            if getattr(generation, field) is None
+        ]
+        if len(unconfirmed_stages) > 0:
+            raise ApplicationError(
+                "Cannot publish the build registry generation, unconfirmed stages: "
+                f"{unconfirmed_stages}",
+                non_retryable=True,
+            )
+
+        generation.status = active
+        generation.published_at = timezone.now()
+        generation.save(update_fields=["status", "published_at"])
+
+        BuildRegistry.objects.filter(pk=registry.pk).update(
+            health_status=BuildRegistry.RegistryHealthStatus.HEALTHY,
+            healthcheck_message="Service deployed successfully",
+        )
+
+        BuildRegistryGeneration.objects.filter(
+            registry_id=registry.pk,
+            status=active,
+        ).exclude(pk=generation.pk).update(status=superseded)
+
+        # Older in-flight attempts can never become active once a newer
+        # generation is published.
+        BuildRegistryGeneration.objects.filter(
+            registry_id=registry.pk,
+            status=BuildRegistryGeneration.GenerationStatus.STAGING,
+            version__lt=generation.version,
+        ).update(status=superseded)
+
+        return cast(str, active)
+
+
+@activity.defn
+async def publish_registry_generation(generation_id: str) -> str:
+    return await sync_to_async(
+        _publish_registry_generation_sync,
+        thread_sensitive=True,
+    )(generation_id)

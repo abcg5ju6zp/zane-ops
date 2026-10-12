@@ -1,5 +1,5 @@
 from django.db import models
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 from zane_api.models.base import TimestampedModel
 from shortuuid.django_fields import ShortUUIDField
 from django.utils.translation import gettext_lazy as _
@@ -109,7 +109,11 @@ class BuildRegistry(TimestampedModel):
 
     @property
     def workflow_id(self) -> str:
-        return f"deploy-{self.id}-v{self.version}"
+        return self.get_generation_workflow_id(self.id, self.version)
+
+    @classmethod
+    def get_generation_workflow_id(cls, registry_id: str, version: int) -> str:
+        return f"deploy-{registry_id}-v{version}"
 
     @property
     def monitor_schedule_id(self) -> str:
@@ -141,3 +145,129 @@ class BuildRegistry(TimestampedModel):
         ]
         indexes = [models.Index(fields=["registry_domain"])]
         ordering = ["created_at"]
+
+
+class BuildRegistryGeneration(TimestampedModel):
+    """
+    Immutable, queryable configuration generation for a build registry.
+
+    A generation is created in ``STAGING`` with an immutable snapshot of the
+    target configuration (domain, credentials, storage, ...). It only becomes
+    ``ACTIVE`` once the Swarm service, the proxy route and the health check
+    schedule have all been confirmed for its version. Previously active
+    generations are kept as immutable snapshots and marked ``SUPERSEDED``;
+    their external resources are reaped by reference after the new generation
+    is published.
+    """
+
+    ID_PREFIX = "build_reg_gen_"
+
+    if TYPE_CHECKING:
+        from django.db.models.manager import RelatedManager
+
+        registry: "BuildRegistry"
+
+    id = ShortUUIDField(  # type: ignore[arg-type]
+        length=20,
+        max_length=255,
+        primary_key=True,
+        prefix=ID_PREFIX,
+    )
+
+    registry: models.ForeignKey["BuildRegistry"] = models.ForeignKey(
+        to="container_registry.BuildRegistry",
+        on_delete=models.CASCADE,
+        related_name="generations",
+    )
+
+    version = models.PositiveIntegerField()
+
+    # Immutable snapshot of the configuration target of this generation:
+    # name, registry_domain, registry_username, registry_password, is_secure,
+    # storage_backend, s3_credentials, service_alias, swarm_service_name,
+    # monitor_schedule_id.
+    snapshot = models.JSONField()
+
+    class GenerationStatus(models.TextChoices):
+        STAGING = "STAGING", _("Staging")
+        ACTIVE = "ACTIVE", _("Active")
+        SUPERSEDED = "SUPERSEDED", _("Superseded")
+
+    status = models.CharField(
+        max_length=20,
+        choices=GenerationStatus.choices,
+        default=GenerationStatus.STAGING,
+    )
+
+    # Persisted stage confirmations, used to recover without re-incrementing
+    # the version and to only publish once every stage is confirmed.
+    staged_at = models.DateTimeField(null=True)
+    swarm_confirmed_at = models.DateTimeField(null=True)
+    proxy_confirmed_at = models.DateTimeField(null=True)
+    schedule_confirmed_at = models.DateTimeField(null=True)
+    published_at = models.DateTimeField(null=True)
+    cleaned_at = models.DateTimeField(null=True)
+
+    # Fields of the snapshot that affect the deployed registry. Changes to
+    # `is_default` do not require a new generation.
+    DEPLOYMENT_FIELDS = (
+        "name",
+        "registry_domain",
+        "registry_username",
+        "registry_password",
+        "is_secure",
+        "storage_backend",
+        "s3_credentials",
+    )
+
+    @property
+    def workflow_id(self) -> str:
+        return BuildRegistry.get_generation_workflow_id(
+            self.registry_id, self.version
+        )
+
+    @classmethod
+    def snapshot_from_registry(
+        cls,
+        registry: "BuildRegistry",
+        *,
+        version: int | None = None,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        snapshot = {
+            "name": registry.name,
+            "registry_domain": registry.registry_domain,
+            "registry_username": registry.registry_username,
+            "registry_password": registry.registry_password,
+            "is_secure": registry.is_secure,
+            "storage_backend": registry.storage_backend,
+            "s3_credentials": registry.s3_credentials,
+            "service_alias": registry.service_alias,
+            "swarm_service_name": registry.swarm_service_name,
+            "monitor_schedule_id": registry.monitor_schedule_id,
+            "version": registry.version if version is None else version,
+        }
+        if overrides is not None:
+            snapshot.update(overrides)
+        return snapshot
+
+    def deployment_fields_match(self, other_snapshot: dict[str, Any]) -> bool:
+        return all(
+            self.snapshot.get(field) == other_snapshot.get(field)
+            for field in self.DEPLOYMENT_FIELDS
+        )
+
+    class Meta:  # type: ignore
+        constraints = [
+            models.UniqueConstraint(
+                fields=["registry", "version"],
+                name="unique_registry_generation_version",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["registry", "status"],
+                name="container_r_gen_status_idx",
+            ),
+        ]
+        ordering = ["version"]

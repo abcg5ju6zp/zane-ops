@@ -427,6 +427,7 @@ class WorkflowScheduleHandle:
     interval: timedelta
     is_running: bool = True
     note: Optional[str] = None
+    args: Any = None
 
 
 class AuthAPITestCase(APITestCase):
@@ -545,6 +546,32 @@ class AuthAPITestCase(APITestCase):
                 WorkflowScheduleHandle(id, interval=interval, workflow=workflow)
             )
 
+        async def aupsert_schedule(
+            workflow: Any,
+            args: Any,
+            id: str,
+            interval: timedelta,
+            *_args,
+            **_kwargs,
+        ):
+            existing_handle = find_item_in_sequence(
+                lambda handle: handle.id == id, self.workflow_schedules
+            )
+            if existing_handle is not None:
+                existing_handle.workflow = workflow
+                existing_handle.args = args
+                existing_handle.interval = interval
+                existing_handle.is_running = True
+            else:
+                self.workflow_schedules.append(
+                    WorkflowScheduleHandle(
+                        id,
+                        interval=interval,
+                        workflow=workflow,
+                        args=args,
+                    )
+                )
+
         async def pause_schedule(id: str, note: str | None = None):
             schedule_handle = find_item_in_sequence(
                 lambda handle: handle.id == id, self.workflow_schedules
@@ -572,6 +599,10 @@ class AuthAPITestCase(APITestCase):
             "temporal.activities.TemporalClient.acreate_schedule",
             side_effect=acreate_schedule,
         )
+        patch_temporal_upsert_schedule = patch(
+            "temporal.activities.TemporalClient.aupsert_schedule",
+            side_effect=aupsert_schedule,
+        )
 
         patch_temporal_pause_schedule = patch(
             "temporal.activities.TemporalClient.apause_schedule",
@@ -586,6 +617,7 @@ class AuthAPITestCase(APITestCase):
             side_effect=delete_schedule,
         )
         patch_temporal_create_schedule.start()
+        patch_temporal_upsert_schedule.start()
         patch_temporal_pause_schedule.start()
         patch_temporal_unpause_schedule.start()
         patch_temporal_delete_schedule.start()
@@ -622,6 +654,7 @@ class AuthAPITestCase(APITestCase):
             patch_temporal_client.stop()
             patch_transaction_on_commit.stop()
             patch_temporal_create_schedule.stop()
+            patch_temporal_upsert_schedule.stop()
             patch_temporal_pause_schedule.stop()
             patch_temporal_unpause_schedule.stop()
             patch_temporal_delete_schedule.stop()

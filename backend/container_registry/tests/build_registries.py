@@ -1,19 +1,32 @@
 from typing import cast
 
 import requests
+from asgiref.sync import sync_to_async
+from unittest.mock import patch
 from zane_api.tests.base import AuthAPITestCase, FakeDockerClient, FakeS3Client
 
 import responses
 from django.urls import reverse
 from zane_api.utils import jprint, find_item_in_sequence
 from rest_framework import status
-from ..models import BuildRegistry
+from ..models import BuildRegistry, BuildRegistryGeneration
 from zane_api.models import Deployment, DeploymentChange
 
 from django.conf import settings
 from temporal.proxy import ZaneProxyClient
 
-from temporal.activities.registries import get_config_name_for_registry
+from temporal.activities.registries import (
+    get_config_name_for_registry,
+    reconcile_build_registry_swarm_service,
+    cleanup_superseded_registry_configs,
+    _publish_registry_generation_sync,
+)
+from temporal.schedules.activities import MonitorRegistryDeploymentActivites
+from temporal.shared import (
+    RegistryHealthCheckResult,
+    SwarmRegistryServiceDetails,
+    registry_snapshot_from_generation,
+)
 
 
 class BuildRegistryViewTests(AuthAPITestCase):
@@ -829,6 +842,383 @@ class BuildRegistryViewTests(AuthAPITestCase):
         print(config_file.data)
         print("==[end config_file.data]==")
         self.assertTrue("s3:" in config_file.data)
+
+
+    def test_retry_of_partial_update_reuses_generation_and_keeps_version(self):
+        self.loginUser()
+
+        registry = BuildRegistry.objects.create(
+            name="default",
+            registry_domain="registry.example.com",
+            registry_username="zane",
+            registry_password="password",
+        )
+
+        body = {
+            "is_default": True,
+            "name": "updated",
+            "registry_domain": "registry-new.example.com",
+            "registry_username": "batman",
+            "registry_password": "supersecret",
+        }
+        # first request: the workflow never runs in this test, so the
+        # generation remains in flight (STAGING), mimicking a partial failure.
+        response = self.client.patch(
+            reverse(
+                "container_registry:build_registries.details",
+                kwargs={"id": registry.id},
+            ),
+            data=body,
+        )
+        jprint(response.json())
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        registry.refresh_from_db()
+        self.assertEqual(2, registry.version)
+
+        staging_generation = cast(
+            BuildRegistryGeneration,
+            registry.generations.order_by("-version").first(),
+        )
+        self.assertEqual(2, staging_generation.version)
+        self.assertEqual(
+            BuildRegistryGeneration.GenerationStatus.STAGING,
+            staging_generation.status,
+        )
+
+        # retrying the exact same change continues the same generation instead
+        # of incrementing the version again
+        response = self.client.patch(
+            reverse(
+                "container_registry:build_registries.details",
+                kwargs={"id": registry.id},
+            ),
+            data=body,
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        registry.refresh_from_db()
+        self.assertEqual(2, registry.version)
+        self.assertEqual(1, registry.generations.count())
+        self.assertEqual(
+            "registry-new.example.com",
+            staging_generation.snapshot["registry_domain"],
+        )
+        self.assertEqual(
+            BuildRegistryGeneration.GenerationStatus.STAGING,
+            registry.generations.get().status,
+        )
+        self.assertEqual(
+            f"deploy-{registry.id}-v2",
+            registry.generations.get().workflow_id,
+        )
+
+    @responses.activate()
+    async def test_generations_preserve_immutable_snapshots_and_publish_gate(self):
+        await self.aLoginUser()
+        responses.add_passthru(settings.CADDY_PROXY_ADMIN_HOST)
+        responses.add_passthru(settings.LOKI_HOST)
+
+        body = {
+            "name": "My registry",
+            "is_default": True,
+            "registry_domain": "registry.127.0.0.0.1.sslip.io",
+        }
+        response = await self.async_client.post(
+            reverse("container_registry:build_registries.list"), data=body
+        )
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code)
+
+        registry = cast(BuildRegistry, await BuildRegistry.objects.afirst())
+
+        body = {
+            "is_default": True,
+            "name": "My registry 2",
+            "registry_username": "batman",
+            "registry_password": "supers3cr4tpassw4rd",
+            "registry_domain": "registry.example.com",
+        }
+        response = await self.async_client.patch(
+            reverse(
+                "container_registry:build_registries.details",
+                kwargs={"id": registry.id},
+            ),
+            data=body,
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+
+        generations = [
+            gen
+            async for gen in registry.generations.order_by("version")
+        ]
+        self.assertEqual(2, len(generations))
+        first, second = generations
+
+        # queryable, immutable snapshots of both the old active config and the
+        # new target config
+        self.assertEqual(1, first.version)
+        self.assertEqual(
+            BuildRegistryGeneration.GenerationStatus.SUPERSEDED, first.status
+        )
+        self.assertEqual(
+            "registry.127.0.0.0.1.sslip.io",
+            first.snapshot["registry_domain"],
+        )
+
+        self.assertEqual(2, second.version)
+        self.assertEqual(
+            BuildRegistryGeneration.GenerationStatus.ACTIVE, second.status
+        )
+        self.assertEqual(
+            "registry.example.com", second.snapshot["registry_domain"]
+        )
+        self.assertEqual("batman", second.snapshot["registry_username"])
+
+        # every external stage was persisted before publication
+        self.assertIsNotNone(second.staged_at)
+        self.assertIsNotNone(second.swarm_confirmed_at)
+        self.assertIsNotNone(second.proxy_confirmed_at)
+        self.assertIsNotNone(second.schedule_confirmed_at)
+        self.assertIsNotNone(second.published_at)
+
+        await registry.arefresh_from_db()
+        self.assertEqual(2, registry.version)
+        self.assertEqual(
+            BuildRegistry.RegistryHealthStatus.HEALTHY, registry.health_status
+        )
+
+        # the health schedule carries the new generation arguments
+        schedule_handle = self.get_workflow_schedule_by_id(
+            registry.monitor_schedule_id
+        )
+        self.assertIsNotNone(schedule_handle)
+        self.assertEqual(2, schedule_handle.args.version)
+
+    @responses.activate()
+    async def test_late_health_result_from_old_generation_is_dropped(self):
+        await self.aLoginUser()
+        responses.add_passthru(settings.CADDY_PROXY_ADMIN_HOST)
+        responses.add_passthru(settings.LOKI_HOST)
+
+        body = {
+            "name": "My registry",
+            "is_default": True,
+            "registry_domain": "registry.127.0.0.0.1.sslip.io",
+        }
+        response = await self.async_client.post(
+            reverse("container_registry:build_registries.list"), data=body
+        )
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code)
+        registry = cast(BuildRegistry, await BuildRegistry.objects.afirst())
+
+        response = await self.async_client.patch(
+            reverse(
+                "container_registry:build_registries.details",
+                kwargs={"id": registry.id},
+            ),
+            data={
+                "is_default": True,
+                "registry_domain": "registry.example.com",
+            },
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+
+        monitor = MonitorRegistryDeploymentActivites()
+
+        # a late v1 health result must not overwrite the v2 state
+        await monitor.save_registry_health_check_status(
+            RegistryHealthCheckResult(
+                id=registry.id,
+                version=1,
+                status=BuildRegistry.RegistryHealthStatus.UNHEALTHY,
+                reason="late result from the previous generation",
+            )
+        )
+        await registry.arefresh_from_db()
+        self.assertEqual(
+            BuildRegistry.RegistryHealthStatus.HEALTHY, registry.health_status
+        )
+
+        # a current generation result still applies
+        await monitor.save_registry_health_check_status(
+            RegistryHealthCheckResult(
+                id=registry.id,
+                version=2,
+                status=BuildRegistry.RegistryHealthStatus.UNHEALTHY,
+                reason="current generation failure",
+            )
+        )
+        await registry.arefresh_from_db()
+        self.assertEqual(
+            BuildRegistry.RegistryHealthStatus.UNHEALTHY,
+            registry.health_status,
+        )
+
+    @responses.activate()
+    async def test_publish_arbitration_never_lets_old_generation_win(self):
+        await self.aLoginUser()
+        responses.add_passthru(settings.CADDY_PROXY_ADMIN_HOST)
+        responses.add_passthru(settings.LOKI_HOST)
+
+        body = {
+            "name": "My registry",
+            "is_default": True,
+            "registry_domain": "registry.127.0.0.0.1.sslip.io",
+        }
+        response = await self.async_client.post(
+            reverse("container_registry:build_registries.list"), data=body
+        )
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code)
+        registry = cast(BuildRegistry, await BuildRegistry.objects.afirst())
+
+        response = await self.async_client.patch(
+            reverse(
+                "container_registry:build_registries.details",
+                kwargs={"id": registry.id},
+            ),
+            data={
+                "is_default": True,
+                "registry_domain": "registry.example.com",
+            },
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+
+        # an outdated v1 workflow reaching publish after v2 is live
+        old_generation = await registry.generations.aget(version=1)
+        old_generation.status = BuildRegistryGeneration.GenerationStatus.STAGING
+        await old_generation.asave()
+
+        publish_status = await sync_to_async(_publish_registry_generation_sync)(
+            old_generation.id
+        )
+        self.assertEqual(
+            BuildRegistryGeneration.GenerationStatus.SUPERSEDED, publish_status
+        )
+
+        await registry.arefresh_from_db()
+        await old_generation.arefresh_from_db()
+        self.assertEqual(2, registry.version)
+        self.assertEqual("registry.example.com", registry.registry_domain)
+        self.assertEqual(
+            BuildRegistry.RegistryHealthStatus.HEALTHY, registry.health_status
+        )
+        self.assertEqual(
+            BuildRegistryGeneration.GenerationStatus.SUPERSEDED,
+            old_generation.status,
+        )
+
+    @responses.activate()
+    async def test_swarm_reconcile_does_not_update_service_twice(self):
+        await self.aLoginUser()
+        responses.add_passthru(settings.CADDY_PROXY_ADMIN_HOST)
+        responses.add_passthru(settings.LOKI_HOST)
+
+        body = {
+            "name": "My registry",
+            "is_default": True,
+            "registry_domain": "registry.127.0.0.0.1.sslip.io",
+        }
+        response = await self.async_client.post(
+            reverse("container_registry:build_registries.list"), data=body
+        )
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code)
+        registry = cast(BuildRegistry, await BuildRegistry.objects.afirst())
+
+        response = await self.async_client.patch(
+            reverse(
+                "container_registry:build_registries.details",
+                kwargs={"id": registry.id},
+            ),
+            data={
+                "is_default": True,
+                "registry_domain": "registry.example.com",
+            },
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+
+        generation = await registry.generations.aget(version=2)
+        snapshot = registry_snapshot_from_generation(generation)
+        swarm_service = cast(
+            FakeDockerClient.FakeService,
+            self.fake_docker_client.service_map.get(
+                cast(str, registry.swarm_service_name)
+            ),
+        )
+
+        details = SwarmRegistryServiceDetails(
+            alias=cast(str, registry.service_alias),
+            swarm_id=cast(str, registry.swarm_service_name),
+            configs={},
+            registry=snapshot,
+            generation_id=generation.id,
+        )
+
+        # the service already runs v2: reconcile must not issue an update
+        with patch.object(
+            FakeDockerClient.FakeService, "update"
+        ) as update_spy:
+            await reconcile_build_registry_swarm_service(details)
+            update_spy.assert_not_called()
+
+        # if the running task and the spec still target v1, exactly one update
+        # is issued, and a second reconcile after that is a no-op
+        swarm_service.labels["version"] = "1"
+        swarm_service.attrs["Spec"]["Labels"]["version"] = "1"
+        newest_task = swarm_service.swarm_tasks[-1]
+        newest_task["Spec"]["ContainerSpec"]["Env"] = [
+            env if not env.startswith("__ZANE_VERSION=") else "__ZANE_VERSION=1"
+            for env in newest_task["Spec"]["ContainerSpec"]["Env"]
+        ]
+        with patch.object(
+            FakeDockerClient.FakeService, "update", wraps=swarm_service.update
+        ) as update_spy:
+            await reconcile_build_registry_swarm_service(details)
+            self.assertEqual(1, update_spy.call_count)
+            await reconcile_build_registry_swarm_service(details)
+            self.assertEqual(1, update_spy.call_count)
+
+    @responses.activate()
+    async def test_cleanup_never_reaps_active_generation_configs(self):
+        await self.aLoginUser()
+        responses.add_passthru(settings.CADDY_PROXY_ADMIN_HOST)
+        responses.add_passthru(settings.LOKI_HOST)
+
+        body = {
+            "name": "My registry",
+            "is_default": True,
+            "registry_domain": "registry.127.0.0.0.1.sslip.io",
+        }
+        response = await self.async_client.post(
+            reverse("container_registry:build_registries.list"), data=body
+        )
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code)
+        registry = cast(BuildRegistry, await BuildRegistry.objects.afirst())
+
+        response = await self.async_client.patch(
+            reverse(
+                "container_registry:build_registries.details",
+                kwargs={"id": registry.id},
+            ),
+            data={
+                "is_default": True,
+                "registry_domain": "registry.example.com",
+            },
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+
+        await registry.arefresh_from_db()
+        active_generation = await registry.generations.aget(version=2)
+        active_config = self.fake_docker_client.config_map.get(
+            get_config_name_for_registry(registry, "config")  # type: ignore
+        )
+        active_credentials = self.fake_docker_client.config_map.get(
+            get_config_name_for_registry(registry, "credentials")  # type: ignore
+        )
+        self.assertIsNotNone(active_config)
+        self.assertIsNotNone(active_credentials)
+
+        # re-running the reference-based cleanup keeps the live configs intact
+        await cleanup_superseded_registry_configs(active_generation.id)
+        self.assertIn(active_config.name, self.fake_docker_client.config_map)
+        self.assertIn(active_credentials.name, self.fake_docker_client.config_map)
 
 
 class BuildRegistryProxyTests(AuthAPITestCase):

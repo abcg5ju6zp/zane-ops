@@ -1,6 +1,6 @@
 import asyncio
 
-from typing import Dict, List, TypedDict
+from typing import Dict, List, Optional, TypedDict
 
 from .shared import DeploymentDetails, ProxyURLRoute
 from zane_api.models import Deployment, URL
@@ -412,6 +412,44 @@ class ZaneProxyClient:
     @classmethod
     def get_uri_for_build_registry(cls, registry_alias: str):
         return f"{settings.CADDY_PROXY_ADMIN_HOST}/id/{registry_alias}"
+
+    @classmethod
+    def get_build_registry_route(cls, registry_alias: str) -> Optional[dict]:
+        """
+        Fetch the actual proxy route for a registry alias, returning ``None``
+        when no route exists. Used to reconcile an uncertain upsert response
+        against the real proxy state instead of blindly rewriting the route.
+        """
+        response = requests.get(
+            cls.get_uri_for_build_registry(registry_alias),
+            timeout=5,
+        )
+        if response.status_code == status.HTTP_404_NOT_FOUND:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    @classmethod
+    def is_build_registry_route_up_to_date(
+        cls, route: Optional[dict], registry_alias: str, domain: str
+    ) -> bool:
+        if route is None or route.get("@id") != registry_alias:
+            return False
+        try:
+            hosts = route["match"][0]["host"]
+            handlers = route["handle"][0]["routes"][0]["handle"]
+        except (KeyError, IndexError, TypeError):
+            return False
+        if domain not in hosts:
+            return False
+        for handler in handlers:
+            if handler.get("handler") == "reverse_proxy":
+                upstreams = handler.get("upstreams", [])
+                return any(
+                    upstream.get("dial") == f"{registry_alias}:5000"
+                    for upstream in upstreams
+                )
+        return False
 
     @classmethod
     def _get_request_for_build_registry(

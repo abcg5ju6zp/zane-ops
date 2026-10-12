@@ -1,6 +1,6 @@
 import asyncio
 from datetime import timedelta
-from typing import cast
+from typing import cast, Optional
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
@@ -14,25 +14,35 @@ with workflow.unsafe.imports_passed_through():
         cleanup_docker_registry_service_resources,
         remove_service_registry_url,
         upsert_registry_url_in_proxy,
-        delete_previous_docker_configs_for_registry,
-        update_build_registry_swarm_service,
+        cleanup_superseded_registry_configs,
+        reconcile_build_registry_swarm_service,
         wait_for_registry_service_to_be_updated,
         acquire_registry_deploy_semaphore,
         release_registry_deploy_semaphore,
-        create_registry_health_check_schedule,
+        ensure_registry_health_check_schedule,
         delete_registry_health_check_schedule,
+        get_registry_generation_status,
+        mark_registry_generation_stage,
+        publish_registry_generation,
     )
     from ..schedules import MonitorRegistryDeploymentActivites
-    from container_registry.models import BuildRegistry
+    from container_registry.models import BuildRegistry, BuildRegistryGeneration
 
 from ..shared import (
-    RegistrySnaphot,
     SwarmRegistryServiceDetails,
     DeleteSwarmRegistryServiceDetails,
-    UpdateRegistryPayload,
     DeleteSwarmRegistryDomainDetails,
     RegistryHealthCheckResult,
+    RegistryGenerationStageDetails,
+    BuildRegistryGenerationPayload,
 )
+
+
+def _stage_details(payload: BuildRegistryGenerationPayload, stage: str):
+    return RegistryGenerationStageDetails(
+        generation_id=payload.generation_id,
+        stage=stage,
+    )
 
 
 @workflow.defn(name="destroy-build-registry")
@@ -77,27 +87,48 @@ class DeployBuildRegistryWorkflow:
         )
 
     @workflow.run
-    async def run(self, payload: RegistrySnaphot):
+    async def run(self, payload: BuildRegistryGenerationPayload):
+        target = payload.target
         await workflow.execute_activity(
             acquire_registry_deploy_semaphore,
-            payload.id,
+            target.id,
             start_to_close_timeout=timedelta(minutes=30),
             retry_policy=self.retry_policy,
         )
         try:
+            # Re-run after a failure: if the generation is already published
+            # every remaining step is a no-op, simply short-circuit.
+            generation_status = await workflow.execute_activity(
+                get_registry_generation_status,
+                payload.generation_id,
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=self.retry_policy,
+            )
+            if generation_status != BuildRegistryGeneration.GenerationStatus.STAGING:
+                return
+
+            # Stage resources for the target version; failures never touch the
+            # resources of a previously active version because the resource
+            # names embed the generation version.
             volume, config_data = await asyncio.gather(
                 workflow.execute_activity(
                     create_docker_volume_for_registry,
-                    payload,
+                    target,
                     start_to_close_timeout=timedelta(seconds=5),
                     retry_policy=self.retry_policy,
                 ),
                 workflow.execute_activity(
                     create_docker_configs_for_registry,
-                    payload,
+                    target,
                     start_to_close_timeout=timedelta(seconds=5),
                     retry_policy=self.retry_policy,
                 ),
+            )
+            await workflow.execute_activity(
+                mark_registry_generation_stage,
+                _stage_details(payload, "staged"),
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=self.retry_policy,
             )
 
             await workflow.execute_activity(
@@ -107,13 +138,14 @@ class DeployBuildRegistryWorkflow:
             )
 
             swarm_details = SwarmRegistryServiceDetails(
-                registry=payload,
+                registry=target,
                 configs={
                     cast(str, config.id): config for config in config_data.configs
                 },
                 volume=volume,
-                alias=payload.service_alias,
-                swarm_id=payload.swarm_service_name,
+                alias=target.service_alias,
+                swarm_id=target.swarm_service_name,
+                generation_id=payload.generation_id,
             )
 
             await workflow.execute_activity(
@@ -124,22 +156,63 @@ class DeployBuildRegistryWorkflow:
             )
 
             await workflow.execute_activity(
+                wait_for_registry_service_to_be_updated,
+                target,
+                start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=self.retry_policy,
+            )
+            await workflow.execute_activity(
+                mark_registry_generation_stage,
+                _stage_details(payload, "swarm"),
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=self.retry_policy,
+            )
+
+            await workflow.execute_activity(
                 upsert_registry_url_in_proxy,
-                payload,
+                target,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=self.retry_policy,
+            )
+            await workflow.execute_activity(
+                mark_registry_generation_stage,
+                _stage_details(payload, "proxy"),
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=self.retry_policy,
+            )
+
+            await workflow.execute_activity(
+                ensure_registry_health_check_schedule,
+                target,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=self.retry_policy,
+            )
+            await workflow.execute_activity(
+                mark_registry_generation_stage,
+                _stage_details(payload, "schedule"),
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=self.retry_policy,
+            )
+
+            # Only publish once Swarm, the proxy entry and the health schedule
+            # are all confirmed for the target generation.
+            await workflow.execute_activity(
+                publish_registry_generation,
+                payload.generation_id,
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=self.retry_policy,
             )
 
             await workflow.execute_activity(
-                create_registry_health_check_schedule,
-                payload,
-                start_to_close_timeout=timedelta(seconds=30),
+                cleanup_superseded_registry_configs,
+                payload.generation_id,
+                start_to_close_timeout=timedelta(seconds=5),
                 retry_policy=self.retry_policy,
             )
         finally:
             await workflow.execute_activity(
                 release_registry_deploy_semaphore,
-                payload.id,
+                target.id,
                 start_to_close_timeout=timedelta(seconds=5),
                 retry_policy=self.retry_policy,
             )
@@ -153,38 +226,62 @@ class UpdateBuildRegistryWorkflow:
         )
 
     @workflow.run
-    async def run(self, payload: UpdateRegistryPayload):
+    async def run(self, payload: BuildRegistryGenerationPayload):
+        target = payload.target
         await workflow.execute_activity(
             acquire_registry_deploy_semaphore,
-            payload.id,
+            target.id,
             start_to_close_timeout=timedelta(minutes=30),
             retry_policy=self.retry_policy,
         )
-        healthcheck = RegistryHealthCheckResult(
-            id=payload.id,
-            status=BuildRegistry.RegistryHealthStatus.RESTARTING,
-            reason="Redeploying registry...",
-        )
+
         await workflow.execute_activity_method(
             MonitorRegistryDeploymentActivites.save_registry_health_check_status,
-            healthcheck,
+            RegistryHealthCheckResult(
+                id=target.id,
+                version=target.version,
+                status=BuildRegistry.RegistryHealthStatus.RESTARTING,
+                reason="Redeploying registry...",
+            ),
             retry_policy=self.retry_policy,
             start_to_close_timeout=timedelta(seconds=10),
         )
+
+        healthcheck: Optional[RegistryHealthCheckResult] = None
         try:
+            # A retried/outdated workflow reconciles through the generation:
+            # only the workflow of the current staging generation proceeds.
+            generation_status = await workflow.execute_activity(
+                get_registry_generation_status,
+                payload.generation_id,
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=self.retry_policy,
+            )
+            if generation_status != BuildRegistryGeneration.GenerationStatus.STAGING:
+                # generation already active or superseded by a newer change
+                return
+
+            # Prepare the new config & credentials in versioned staging
+            # resources; the active version keeps running untouched.
             volume, config_data = await asyncio.gather(
                 workflow.execute_activity(
                     create_docker_volume_for_registry,
-                    payload.current,
+                    target,
                     start_to_close_timeout=timedelta(seconds=5),
                     retry_policy=self.retry_policy,
                 ),
                 workflow.execute_activity(
                     create_docker_configs_for_registry,
-                    payload.current,
+                    target,
                     start_to_close_timeout=timedelta(seconds=5),
                     retry_policy=self.retry_policy,
                 ),
+            )
+            await workflow.execute_activity(
+                mark_registry_generation_stage,
+                _stage_details(payload, "staged"),
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=self.retry_policy,
             )
 
             await workflow.execute_activity(
@@ -194,66 +291,107 @@ class UpdateBuildRegistryWorkflow:
             )
 
             swarm_details = SwarmRegistryServiceDetails(
-                registry=payload.current,
+                registry=target,
                 configs={
                     cast(str, config.id): config for config in config_data.configs
                 },
                 volume=volume,
-                alias=payload.service_alias,
-                swarm_id=payload.swarm_service_name,
+                alias=target.service_alias,
+                swarm_id=target.swarm_service_name,
+                generation_id=payload.generation_id,
             )
 
+            # Verify the actual service state before/after the update so an
+            # uncertain Docker response never causes a duplicate update.
             await workflow.execute_activity(
-                update_build_registry_swarm_service,
+                reconcile_build_registry_swarm_service,
                 swarm_details,
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=self.retry_policy,
-            )
-
-            await workflow.execute_activity(
-                upsert_registry_url_in_proxy,
-                payload.current,
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=self.retry_policy,
-            )
-
-            await workflow.execute_activity(
-                create_registry_health_check_schedule,
-                payload.current,
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=self.retry_policy,
             )
 
             healthcheck = await workflow.execute_activity(
                 wait_for_registry_service_to_be_updated,
-                payload.previous,
+                target,
                 start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=self.retry_policy,
+            )
+            await workflow.execute_activity(
+                mark_registry_generation_stage,
+                _stage_details(payload, "swarm"),
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=self.retry_policy,
+            )
+
+            # Proxy and health schedule are independent, separately persisted
+            # stages: each can be retried on its own while the old proxy entry
+            # keeps pointing at a usable service version.
+            await workflow.execute_activity(
+                upsert_registry_url_in_proxy,
+                target,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=self.retry_policy,
+            )
+            await workflow.execute_activity(
+                mark_registry_generation_stage,
+                _stage_details(payload, "proxy"),
+                start_to_close_timeout=timedelta(seconds=5),
                 retry_policy=self.retry_policy,
             )
 
             await workflow.execute_activity(
-                delete_previous_docker_configs_for_registry,
-                payload.previous,
+                ensure_registry_health_check_schedule,
+                target,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=self.retry_policy,
+            )
+            await workflow.execute_activity(
+                mark_registry_generation_stage,
+                _stage_details(payload, "schedule"),
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=self.retry_policy,
+            )
+
+            publish_status = await workflow.execute_activity(
+                publish_registry_generation,
+                payload.generation_id,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=self.retry_policy,
+            )
+
+            if publish_status != BuildRegistryGeneration.GenerationStatus.ACTIVE:
+                # A newer generation won the arbitration; this workflow must
+                # not mark health nor reap resources.
+                healthcheck = None
+                return
+
+            # Reference-based reaping of the previous generation's configs,
+            # only after the new generation is live.
+            await workflow.execute_activity(
+                cleanup_superseded_registry_configs,
+                payload.generation_id,
                 start_to_close_timeout=timedelta(seconds=5),
                 retry_policy=self.retry_policy,
             )
         except Exception as e:
             healthcheck = RegistryHealthCheckResult(
-                id=payload.id,
+                id=target.id,
+                version=target.version,
                 status=BuildRegistry.RegistryHealthStatus.UNHEALTHY,
                 reason=f"An error occured: {e}",
             )
-
+            raise
         finally:
             await workflow.execute_activity(
                 release_registry_deploy_semaphore,
-                payload.id,
+                target.id,
                 start_to_close_timeout=timedelta(seconds=5),
                 retry_policy=self.retry_policy,
             )
-            await workflow.execute_activity_method(
-                MonitorRegistryDeploymentActivites.save_registry_health_check_status,
-                healthcheck,
-                retry_policy=self.retry_policy,
-                start_to_close_timeout=timedelta(seconds=10),
-            )
+            if healthcheck is not None:
+                await workflow.execute_activity_method(
+                    MonitorRegistryDeploymentActivites.save_registry_health_check_status,
+                    healthcheck,
+                    retry_policy=self.retry_policy,
+                    start_to_close_timeout=timedelta(seconds=10),
+                )

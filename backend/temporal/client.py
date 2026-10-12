@@ -253,6 +253,74 @@ class TemporalClient:
                 pass
 
     @classmethod
+    def upsert_schedule(
+        cls,
+        workflow: Union[str, Callable[..., Awaitable[Any]]],
+        args: Any,
+        id: str,
+        interval: timedelta,
+        task_queue=settings.TEMPORALIO_SCHEDULE_TASK_QUEUE,
+        execution_timeout=settings.TEMPORALIO_WORKFLOW_EXECUTION_MAX_TIMEOUT,
+    ):
+        return async_to_sync(cls.aupsert_schedule)(
+            workflow,
+            args,
+            id,
+            interval,
+            task_queue,
+            execution_timeout,
+        )
+
+    @classmethod
+    async def aupsert_schedule(
+        cls,
+        workflow: Union[str, Callable[..., Awaitable[Any]]],
+        args: Any,
+        id: str,
+        interval: timedelta,
+        task_queue=settings.TEMPORALIO_SCHEDULE_TASK_QUEUE,
+        execution_timeout=settings.TEMPORALIO_WORKFLOW_EXECUTION_MAX_TIMEOUT,
+    ):
+        """
+        Create the schedule, or update it in place (keeping its state/policy)
+        when it already exists so that recurring runs always receive the
+        arguments of the latest configuration generation.
+        """
+        client = await cls._ensure_client()
+
+        def build_schedule():
+            return Schedule(
+                action=ScheduleActionStartWorkflow(
+                    workflow=workflow,
+                    arg=args,
+                    id=id,
+                    task_queue=task_queue,
+                    execution_timeout=execution_timeout,
+                ),
+                spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=interval)]),
+            )
+
+        try:
+            await client.create_schedule(f"schedule-{id}", build_schedule())
+        except ScheduleAlreadyRunningError:
+            handle = client.get_schedule_handle(f"schedule-{id}")
+
+            def update_schedule_simple(input: ScheduleUpdateInput):
+                current = input.description.schedule
+                return ScheduleUpdate(
+                    schedule=Schedule(
+                        action=build_schedule().action,
+                        spec=build_schedule().spec,
+                        policy=current.policy,
+                        state=current.state,
+                    )
+                )
+
+            await handle.update(
+                update_schedule_simple, rpc_timeout=timedelta(seconds=10)
+            )
+
+    @classmethod
     def pause_schedule(cls, id: str, note: Optional[str] = None):
         return async_to_sync(cls.apause_schedule)(id, note)
 
