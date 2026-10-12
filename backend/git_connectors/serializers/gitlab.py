@@ -116,6 +116,10 @@ class GitlabWebhookPushEventRequestSerializer(serializers.Serializer):
 # ====================================#
 
 
+class GitlabMergeRequestLastCommitSerializer(serializers.Serializer):
+    id = serializers.CharField(validators=[validate_git_commit_sha])
+
+
 class GitlabMergeRequestDetailsSerializer(serializers.Serializer):
     action = serializers.ChoiceField(
         choices=[
@@ -141,6 +145,7 @@ class GitlabMergeRequestDetailsSerializer(serializers.Serializer):
     target_branch = serializers.CharField()
     source_branch = serializers.CharField()
     oldrev = serializers.CharField(required=False, validators=[validate_git_commit_sha])
+    last_commit = GitlabMergeRequestLastCommitSerializer(required=False)
 
 
 class GitlabMergeRequestAuthor(serializers.Serializer):

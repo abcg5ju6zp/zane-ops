@@ -72,6 +72,7 @@ class GithubWebhookEvent:
 class GithubWebhookEventSerializer(serializers.Serializer):
     event = serializers.ChoiceField(choices=GithubWebhookEvent.choices())
     signature256 = serializers.CharField()
+    delivery_id = serializers.CharField(required=False, allow_null=True)
 
 
 # ==========================================
@@ -139,6 +140,8 @@ class GithubWebhookCommitSerializer(serializers.Serializer):
 
 class GithubWebhookPushRequestSerializer(serializers.Serializer):
     ref = serializers.CharField()
+    before = serializers.CharField(required=False, allow_blank=False)
+    after = serializers.CharField(required=False, allow_blank=False)
     installation = SimpleGithubWebhookInstallationBodyRequestSerializer()
     repository = GithubWebhookRepositoryRequestSerializer()
     head_commit = GithubWebhookCommitSerializer(allow_null=True)

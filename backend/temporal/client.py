@@ -113,6 +113,39 @@ class TemporalClient:
         return client.get_workflow_handle(id)
 
     @classmethod
+    def workflow_exists(
+        cls,
+        workflow: Union[str, Callable[..., Awaitable[Any]]],
+        workflow_id: str,
+    ) -> bool:
+        """
+        Check whether a workflow with this ID already exists in Temporal.
+
+        Used after an ambiguous start response (timeout / connection error):
+        if the workflow exists, the original start succeeded and no new
+        deployment/preview needs to be created.
+        """
+        return async_to_sync(cls.aworkflow_exists)(workflow, workflow_id)
+
+    @classmethod
+    async def aworkflow_exists(
+        cls,
+        workflow: Union[str, Callable[..., Awaitable[Any]]],
+        workflow_id: str,
+    ) -> bool:
+        client = await cls._ensure_client()
+        handle = client.get_workflow_handle_for(
+            workflow=workflow, workflow_id=workflow_id
+        )
+        try:
+            await handle.describe()
+            return True
+        except RPCError:
+            # NOT_FOUND means the workflow never started; any other RPC
+            # failure leaves existence unresolved and the caller must retry.
+            return False
+
+    @classmethod
     def workflow_signal(
         cls,
         workflow: Union[

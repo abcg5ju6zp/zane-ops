@@ -2,6 +2,7 @@
 from django.db import models
 from shortuuid.django_fields import ShortUUIDField
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 from zane_api.utils import (
     cache_result,
     add_suffix_if_missing,
@@ -382,6 +383,160 @@ class GitlabApp(TimestampedModel):
     def get_authenticated_repository_url(self, repo_url: str):
         access_token = GitlabApp.ensure_fresh_access_token(self)
         return f"https://oauth2:{access_token}@{re.sub(r'https?://', '', repo_url)}"
-    
+
     async def aget_authenticated_repository_url(self, repo_url: str) -> str:
         return await sync_to_async(self.get_authenticated_repository_url)(repo_url)
+
+
+ZERO_COMMIT_SHA = "0" * 40
+
+
+class GitWebhookDelivery(TimestampedModel):
+    """
+    Stable, idempotent record of a single provider webhook delivery.
+
+    The identity of an event is fixed by the provider delivery id
+    (`X-GitHub-Delivery` for GitHub, a digest of the raw body for GitLab and
+    older GitHub deliveries), the installation/app identity and the digest of
+    the verified raw payload. Effects (repository changes, deployments,
+    previews) and Temporal workflow starts are attached to it through
+    replayable stages so retries, crashes and restarts converge to a single
+    result.
+    """
+
+    class Provider(models.TextChoices):
+        GITHUB = "github", _("Github")
+        GITLAB = "gitlab", _("Gitlab")
+
+    class Stage(models.TextChoices):
+        # signature verified, event ledgered, no effect applied yet
+        VERIFIED = "VERIFIED", _("Verified")
+        # database effects committed, temporal starts not all confirmed
+        EFFECTS_COMMITTED = "EFFECTS_COMMITTED", _("Effects committed")
+        # every temporal workflow start has been confirmed
+        STARTED = "STARTED", _("Started")
+        # valid event but superseded by a newer ref generation
+        IGNORED = "IGNORED", _("Ignored")
+
+    ID_PREFIX = "wh_evt_"
+    id = ShortUUIDField(
+        length=14,
+        max_length=255,
+        primary_key=True,
+        prefix=ID_PREFIX,
+    )
+    provider = models.CharField(max_length=20, choices=Provider.choices)
+    delivery_id = models.CharField(max_length=128)
+    git_app = models.ForeignKey(
+        "zane_api.GitApp",
+        on_delete=models.CASCADE,
+        related_name="webhook_deliveries",
+    )
+    event_type = models.CharField(max_length=64)
+    action = models.CharField(max_length=64, null=True, blank=True)
+    payload_digest = models.CharField(max_length=64)
+
+    repository_url = models.URLField(blank=True, default="")
+    ref_name = models.CharField(max_length=255, blank=True, default="")
+    head_sha = models.CharField(max_length=40, null=True, blank=True)
+    pr_number = models.PositiveIntegerField(null=True)
+
+    stage = models.CharField(
+        max_length=30, choices=Stage.choices, default=Stage.VERIFIED
+    )
+    stale = models.BooleanField(default=False)
+    response_status = models.PositiveSmallIntegerField(default=200)
+    # serialized workflow starts: [{workflow, workflow_id, start_delay_seconds, status, payload}]
+    starts = models.JSONField(default=list)
+    # serialized cancellation signals: [{workflow, workflow_id, deployment_hash}]
+    signals = models.JSONField(default=list)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider", "git_app", "delivery_id"],
+                name="unique_webhook_delivery_per_app",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["stage"]),
+            models.Index(fields=["provider", "event_type"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"GitWebhookDelivery(provider={self.provider}, delivery_id={self.delivery_id}, "
+            f"event={self.event_type}, stage={self.stage})"
+        )
+
+    @property
+    def is_finished(self) -> bool:
+        return self.stage in (self.Stage.STARTED, self.Stage.IGNORED)
+
+
+class GitRefGeneration(models.Model):
+    """
+    Current generation of a branch or pull request for an app/repository.
+
+    Only events matching the current generation are allowed to publish
+    deployments or previews: late pushes, superseded merge request updates and
+    reopen/redelivery after a close cannot roll commits back or recreate
+    already closed previews.
+    """
+
+    class RefKind(models.TextChoices):
+        BRANCH = "BRANCH", _("Branch")
+        PULL_REQUEST = "PULL_REQUEST", _("Pull request")
+
+    class RefState(models.TextChoices):
+        ACTIVE = "ACTIVE", _("Active")
+        CLOSED = "CLOSED", _("Closed")
+        DELETED = "DELETED", _("Deleted")
+
+    ID_PREFIX = "wh_ref_"
+    id = ShortUUIDField(
+        length=14,
+        max_length=255,
+        primary_key=True,
+        prefix=ID_PREFIX,
+    )
+    git_app = models.ForeignKey(
+        "zane_api.GitApp",
+        on_delete=models.CASCADE,
+        related_name="ref_generations",
+    )
+    repository_url = models.URLField()
+    kind = models.CharField(max_length=20, choices=RefKind.choices)
+    ref_name = models.CharField(max_length=255)
+    # PR number for pull requests, 0 for plain branches
+    pr_number = models.PositiveIntegerField(default=0)
+    head_sha = models.CharField(max_length=40, null=True, blank=True)
+    state = models.CharField(
+        max_length=20, choices=RefState.choices, default=RefState.ACTIVE
+    )
+    last_delivery = models.ForeignKey(
+        GitWebhookDelivery,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="ref_generations",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["git_app", "repository_url", "kind", "ref_name", "pr_number"],
+                name="unique_ref_generation",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["git_app", "repository_url", "state"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"GitRefGeneration(app={self.git_app_id}, repo={self.repository_url}, "
+            f"kind={self.kind}, ref={self.ref_name}, pr={self.pr_number}, state={self.state})"
+        )

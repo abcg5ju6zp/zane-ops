@@ -23,7 +23,7 @@ from drf_spectacular.utils import extend_schema, inline_serializer
 
 from zane_api.views import BadRequest
 from django.conf import settings
-from temporal.client import TemporalClient, StartWorkflowArg, SignalWorkflowArg
+from temporal.client import StartWorkflowArg, SignalWorkflowArg
 from temporal.workflows import (
     CreateEnvNetworkWorkflow,
     DeployDockerServiceWorkflow,
@@ -46,7 +46,16 @@ from zane_api.models import (
     PreviewEnvMetadata,
     CloneEnvPreviewPayload,
 )
-from ..models import GitlabApp
+from ..models import GitlabApp, GitWebhookDelivery, ZERO_COMMIT_SHA
+from ..delivery import (
+    arbitrate_branch_push,
+    arbitrate_pull_request,
+    begin_delivery,
+    mark_ignored,
+    persist_effects_and_schedule,
+    repository_is_connected,
+    schedule_duplicate_replay,
+)
 from django.core.cache import cache
 from zane_api.utils import generate_random_chars
 from rest_framework import permissions
@@ -360,12 +369,14 @@ class GitlabWebhookAPIView(APIView):
 
     @transaction.atomic()
     def post(self, request: Request):
+        request_body: bytes = request.body
         form = GitlabWebhookEventSerializer(
             data={
                 "event": request.headers.get("x-gitlab-event"),
                 "webhook_secret": request.headers.get("x-gitlab-token"),
             }
         )
+        # unsupported events are rejected here, before any state is created
         form.is_valid(raise_exception=True)
 
         event = cast(ReturnDict, form.data)["event"]
@@ -383,6 +394,9 @@ class GitlabWebhookAPIView(APIView):
         form.is_valid(raise_exception=True)
         data = cast(ReturnDict, form.data)
 
+        # token verification resolves the app identity BEFORE the event is
+        # ledgered: invalid deliveries never create repository/deployment
+        # state.
         try:
             gitapp = (
                 GitApp.objects.filter(gitlab__webhook_secret=webhook_secret)
@@ -393,6 +407,52 @@ class GitlabWebhookAPIView(APIView):
             raise exceptions.NotFound("Invalid webhook secret")
 
         gitlab = cast(GitlabApp, gitapp.gitlab)
+
+        if event == GitlabWebhookEvent.PUSH:
+            summary_repository_url = data["repository"]["git_http_url"]
+            push_ref: str = data["ref"]
+            summary_ref_name = (
+                push_ref.replace("refs/heads/", "")
+                if push_ref.startswith("refs/heads/")
+                else ""
+            )
+            summary_head_sha = (
+                None if data["after"] == GITLAB_NULL_COMMIT else data["after"]
+            )
+            summary_pr_number = None
+            summary_action = None
+        else:
+            merge_request_summary = data["object_attributes"]
+            summary_repository_url = merge_request_summary["source"]["git_http_url"]
+            summary_ref_name = merge_request_summary["source_branch"]
+            last_commit = merge_request_summary.get("last_commit")
+            summary_head_sha = last_commit["id"] if last_commit else None
+            summary_pr_number = merge_request_summary["iid"]
+            summary_action = merge_request_summary["action"]
+
+        delivery, created = begin_delivery(
+            provider=GitWebhookDelivery.Provider.GITLAB,
+            git_app_id=gitapp.id,
+            event_type=event,
+            action=summary_action,
+            raw_body=request_body,
+            # GitLab has no provider delivery id, the verified payload digest
+            # is the stable identity.
+            provider_delivery_id=None,
+            repository_url=summary_repository_url,
+            ref_name=summary_ref_name,
+            head_sha=summary_head_sha,
+            pr_number=summary_pr_number,
+        )
+        if not created:
+            # duplicate delivery: return the original accepted result and
+            # continue any unconfirmed workflow start from the first delivery.
+            schedule_duplicate_replay(delivery)
+            return Response(data={"success": True})
+
+        workflows_to_run: List[StartWorkflowArg] = []
+        workflows_signals: List[SignalWorkflowArg] = []
+        delivery_ignored = False
 
         match form:
             case GitlabWebhookPushEventRequestSerializer():
@@ -408,105 +468,133 @@ class GitlabWebhookAPIView(APIView):
                     head_branch_name = ref.replace("refs/heads/", "")
                     repository_url = data["repository"]["git_http_url"]
 
-                    if is_branch_deleted:
-                        environment_delete_payload: list[
-                            tuple[EnvironmentDetails, str]
-                        ] = []
-                        matching_preview_envs = Environment.objects.filter(
-                            is_preview=True,
-                            preview_metadata__source_trigger=Environment.PreviewSourceTrigger.API,
-                            preview_metadata__head_repository_url=repository_url,
-                            preview_metadata__git_app=gitapp,
-                            preview_metadata__branch_name=head_branch_name,
-                            preview_metadata__auto_teardown=True,
-                        ).select_related("project", "preview_metadata")
-                        for environment in matching_preview_envs:
-                            environment_delete_payload.append(
-                                (
-                                    EnvironmentDetails.from_environment(environment),
-                                    environment.archive_workflow_id,
-                                )
-                            )
-                            environment.delete_resources()
-                            environment.delete()
-
-                        def on_commit():
-                            for details, workflow_id in environment_delete_payload:
-                                TemporalClient.start_workflow(
-                                    ArchiveEnvWorkflow.run,
-                                    details,
-                                    id=workflow_id,
-                                )
-
-                        transaction.on_commit(on_commit)
-                    else:
-                        affected_services = (
-                            Service.get_services_triggered_by_push_event(
-                                gitapp=gitapp,
-                                branch_name=head_branch_name,
-                                repository_url=repository_url,
-                            )
+                    if not repository_is_connected(gitapp, repository_url):
+                        # repository no longer attached to this app: the event
+                        # is late and must not deploy anything.
+                        delivery_ignored = True
+                    elif is_branch_deleted:
+                        arbitration = arbitrate_branch_push(
+                            delivery=delivery,
+                            git_app_id=gitapp.id,
+                            repository_url=repository_url,
+                            branch_name=head_branch_name,
+                            before=data.get("before"),
+                            after=GITLAB_NULL_COMMIT,
+                            deleted=True,
                         )
-
-                        deployments_to_cancel: list[Deployment] = []
-                        payloads_for_workflows_to_run: list[DeploymentDetails] = []
-                        changed_paths: set[str] = set()
-                        for commit in data["commits"]:
-                            changed_paths.update(
-                                commit["added"],
-                                commit["removed"],
-                                commit["modified"],
+                        if not arbitration.proceed:
+                            delivery_ignored = True
+                        else:
+                            matching_preview_envs = Environment.objects.filter(
+                                is_preview=True,
+                                preview_metadata__source_trigger=Environment.PreviewSourceTrigger.API,
+                                preview_metadata__head_repository_url=repository_url,
+                                preview_metadata__git_app=gitapp,
+                                preview_metadata__branch_name=head_branch_name,
+                                preview_metadata__auto_teardown=True,
+                            ).select_related("project", "preview_metadata")
+                            for environment in matching_preview_envs:
+                                workflows_to_run.append(
+                                    StartWorkflowArg(
+                                        workflow=ArchiveEnvWorkflow.run,
+                                        payload=EnvironmentDetails.from_environment(
+                                            environment
+                                        ),
+                                        workflow_id=environment.archive_workflow_id,
+                                    )
+                                )
+                                environment.delete_resources()
+                                environment.delete()
+                    else:
+                        head_sha = data["after"]
+                        arbitration = arbitrate_branch_push(
+                            delivery=delivery,
+                            git_app_id=gitapp.id,
+                            repository_url=repository_url,
+                            branch_name=head_branch_name,
+                            before=(data.get("before") or ZERO_COMMIT_SHA),
+                            after=head_sha,
+                        )
+                        if not arbitration.proceed:
+                            # older / out-of-order generation: never roll a
+                            # service back to an older commit
+                            delivery_ignored = True
+                        else:
+                            affected_services = (
+                                Service.get_services_triggered_by_push_event(
+                                    gitapp=gitapp,
+                                    branch_name=head_branch_name,
+                                    repository_url=repository_url,
+                                )
                             )
-                        for service in affected_services:
-                            # ignore service that don't match the paths
-                            if not service.match_paths(changed_paths):
-                                continue
 
-                            if service.cleanup_queue_on_auto_deploy:
-                                deployments_to_cancel.extend(
-                                    Deployment.flag_deployments_for_cancellation(
-                                        service, include_running_deployments=True
+                            deployments_to_cancel: list[Deployment] = []
+                            changed_paths: set[str] = set()
+                            for commit in data["commits"]:
+                                changed_paths.update(
+                                    commit["added"],
+                                    commit["removed"],
+                                    commit["modified"],
+                                )
+                            for service in affected_services:
+                                # ignore service that don't match the paths
+                                if not service.match_paths(changed_paths):
+                                    continue
+
+                                # idempotency guard: an auto deployment for
+                                # this exact commit already exists (concurrent
+                                # duplicate delivery)
+                                if Deployment.objects.filter(
+                                    service=service,
+                                    commit_sha=head_sha,
+                                    trigger_method=Deployment.DeploymentTriggerMethod.AUTO,
+                                ).exists():
+                                    continue
+
+                                if service.cleanup_queue_on_auto_deploy:
+                                    deployments_to_cancel.extend(
+                                        Deployment.flag_deployments_for_cancellation(
+                                            service,
+                                            include_running_deployments=True,
+                                        )
+                                    )
+
+                                commit = (
+                                    GitCommitInfo(
+                                        sha=head_commit["id"],
+                                        message=head_commit["message"],
+                                        author_name=head_commit["author"]["name"],
+                                    )
+                                    if head_commit is not None
+                                    else None
+                                )
+                                new_deployment = service.prepare_new_git_deployment(
+                                    commit=commit,
+                                    trigger_method=Deployment.DeploymentTriggerMethod.AUTO,
+                                )
+
+                                payload = DeploymentDetails.from_deployment(
+                                    deployment=new_deployment
+                                )
+                                workflows_to_run.append(
+                                    StartWorkflowArg(
+                                        workflow=DeployGitServiceWorkflow.run,
+                                        payload=payload,
+                                        workflow_id=payload.workflow_id,
                                     )
                                 )
 
-                            commit = (
-                                GitCommitInfo(
-                                    sha=head_commit["id"],
-                                    message=head_commit["message"],
-                                    author_name=head_commit["author"]["name"],
-                                )
-                                if head_commit is not None
-                                else None
-                            )
-                            new_deployment = service.prepare_new_git_deployment(
-                                commit=commit,
-                                trigger_method=Deployment.DeploymentTriggerMethod.AUTO,
-                            )
-
-                            payloads_for_workflows_to_run.append(
-                                DeploymentDetails.from_deployment(
-                                    deployment=new_deployment
-                                )
-                            )
-
-                        def commit_callback():
                             for dpl in deployments_to_cancel:
-                                TemporalClient.workflow_signal(
-                                    workflow=DeployGitServiceWorkflow.run,
-                                    input=CancelDeploymentSignalInput(
-                                        deployment_hash=dpl.hash
-                                    ),
-                                    signal=DeployGitServiceWorkflow.cancel_deployment,  # type: ignore
-                                    workflow_id=dpl.workflow_id,
+                                workflows_signals.append(
+                                    SignalWorkflowArg(
+                                        workflow=DeployGitServiceWorkflow.run,
+                                        input=CancelDeploymentSignalInput(
+                                            deployment_hash=dpl.hash
+                                        ),
+                                        signal=DeployGitServiceWorkflow.cancel_deployment,  # type: ignore
+                                        workflow_id=dpl.workflow_id,
+                                    )
                                 )
-                            for payload in payloads_for_workflows_to_run:
-                                TemporalClient.start_workflow(
-                                    workflow=DeployGitServiceWorkflow.run,
-                                    arg=payload,
-                                    id=payload.workflow_id,
-                                )
-
-                        transaction.on_commit(commit_callback)
 
             case GitlabWebhookMergeRequestEventRequestSerializer():
                 merge_request = data["object_attributes"]
@@ -514,13 +602,53 @@ class GitlabWebhookAPIView(APIView):
                 head_repository_url = merge_request["source"]["git_http_url"]
                 head_branch_name = merge_request["source_branch"]
                 base_branch_name = merge_request["target_branch"]
+                mr_project_id = data["project"]["id"]
 
                 is_fork = base_repository_url != head_repository_url
 
-                workflows_to_run: List[StartWorkflowArg] = []
-                workflows_signals: List[SignalWorkflowArg] = []
+                mr_head_sha = (
+                    merge_request["last_commit"]["id"]
+                    if merge_request.get("last_commit")
+                    else None
+                )
+                mr_action = merge_request["action"]
+                # the repository attached to the app is always the target
+                # repository (fork source repositories are never installed)
+                mr_gate_repository_url = base_repository_url
+                # ref generation arbitration decides whether this merge
+                # request event is allowed to publish for the current head.
+                if not repository_is_connected(gitapp, mr_gate_repository_url):
+                    delivery_ignored = True
+                elif mr_action == "open":
+                    arbitration = arbitrate_pull_request(
+                        delivery=delivery,
+                        git_app_id=gitapp.id,
+                        repository_url=head_repository_url,
+                        branch_name=head_branch_name,
+                        pr_number=merge_request["iid"],
+                        head_sha=mr_head_sha,
+                        mode="open",
+                    )
+                    if not arbitration.proceed:
+                        delivery_ignored = True
+                elif mr_action == "close" or mr_action == "merge":
+                    arbitrate_pull_request(
+                        delivery=delivery,
+                        git_app_id=gitapp.id,
+                        repository_url=head_repository_url,
+                        branch_name=head_branch_name,
+                        pr_number=merge_request["iid"],
+                        head_sha=mr_head_sha,
+                        mode="close",
+                    )
+                # "update" events are arbitrated below because they mix a
+                # metadata edit with an optional new-push deploy.
+                mr_publish_allowed = not delivery_ignored
 
                 match merge_request["action"]:
+                    case "open" if not mr_publish_allowed:
+                        # late open for a closed/removed pull request
+                        pass
                     case "open":
                         affected_services = (
                             Service.get_services_triggered_by_pull_request_event(
@@ -606,14 +734,13 @@ class GitlabWebhookAPIView(APIView):
                                     slug=current_service.slug
                                 )
                                 # 1️⃣ Define the API endpoint for creating a comment
-                                project_id = data["project"]["id"]
                                 issue_number = merge_request[
                                     "iid"
                                 ]  # issue or PR number
 
                                 # create issue comment
 
-                                url = f"{gitlab.gitlab_url}/api/v4/projects/{project_id}/merge_requests/{issue_number}/notes"
+                                url = f"{gitlab.gitlab_url}/api/v4/projects/{mr_project_id}/merge_requests/{issue_number}/notes"
 
                                 # 2️⃣ Prepare the request
                                 headers = {
@@ -632,15 +759,15 @@ class GitlabWebhookAPIView(APIView):
                                 )
                                 # 4️⃣ Check the response
                                 if response.status_code == status.HTTP_201_CREATED:
-                                    data = response.json()
+                                    comment_data = response.json()
                                     print(
                                         "Comment created:",
-                                        url + f"/{data['id']}",
+                                        url + f"/{comment_data['id']}",
                                     )
-                                    print("Comment Body:\n", data["body"])
+                                    print("Comment Body:\n", comment_data["body"])
 
                                     # Update Preview metadata with the comment ID
-                                    preview_meta.pr_comment_id = data["id"]
+                                    preview_meta.pr_comment_id = comment_data["id"]
                                     preview_meta.save()
                                 else:
                                     print(
@@ -648,7 +775,6 @@ class GitlabWebhookAPIView(APIView):
                                         response.status_code,
                                         response.text,
                                     )
-                                pass
 
                             else:
                                 workflows_to_run.append(
@@ -716,14 +842,13 @@ class GitlabWebhookAPIView(APIView):
 
                                     if current_service.slug == service.slug:
                                         # 1️⃣ Define the API endpoint for creating a comment
-                                        project_id = data["project"]["id"]
                                         issue_number = merge_request[
                                             "iid"
                                         ]  # issue or PR number
 
                                         # create issue comment
 
-                                        url = f"{gitlab.gitlab_url}/api/v4/projects/{project_id}/merge_requests/{issue_number}/notes"
+                                        url = f"{gitlab.gitlab_url}/api/v4/projects/{mr_project_id}/merge_requests/{issue_number}/notes"
 
                                         # 2️⃣ Prepare the request
                                         headers = {
@@ -743,15 +868,20 @@ class GitlabWebhookAPIView(APIView):
                                             response.status_code
                                             == status.HTTP_201_CREATED
                                         ):
-                                            data = response.json()
+                                            comment_data = response.json()
                                             print(
                                                 "Comment created:",
-                                                url + f"/{data['id']}",
+                                                url + f"/{comment_data['id']}",
                                             )
-                                            print("Comment Body:\n", data["body"])
+                                            print(
+                                                "Comment Body:\n",
+                                                comment_data["body"],
+                                            )
 
                                             # Update Preview metadata with the comment ID
-                                            preview_meta.pr_comment_id = data["id"]
+                                            preview_meta.pr_comment_id = comment_data[
+                                                "id"
+                                            ]
                                             preview_meta.save()
                                         else:
                                             print(
@@ -759,7 +889,6 @@ class GitlabWebhookAPIView(APIView):
                                                 response.status_code,
                                                 response.text,
                                             )
-                                        pass
 
                                 if preview_template.ttl_seconds is not None:
                                     workflows_to_run.append(
@@ -798,51 +927,65 @@ class GitlabWebhookAPIView(APIView):
                         # if there was a push on the branch of the merge request
                         is_push_action = merge_request.get("oldrev") is not None
                         if is_push_action:
-                            affected_services = Service.get_services_triggered_by_pull_request_sync_event(
-                                gitapp=gitapp,
+                            # arbitrate the new commit against the current MR
+                            # generation before deploying preview services
+                            sync_arbitration = arbitrate_pull_request(
+                                delivery=delivery,
+                                git_app_id=gitapp.id,
                                 repository_url=head_repository_url,
+                                branch_name=head_branch_name,
                                 pr_number=merge_request["iid"],
+                                head_sha=mr_head_sha,
+                                mode="sync",
+                                oldrev=merge_request.get("oldrev"),
                             )
-
-                            deployments_to_cancel: list[Deployment] = []
-                            payloads_for_workflows_to_run: list[DeploymentDetails] = []
-                            for service in affected_services:
-                                if service.cleanup_queue_on_auto_deploy:
-                                    deployments_to_cancel.extend(
-                                        Deployment.flag_deployments_for_cancellation(
-                                            service, include_running_deployments=True
-                                        )
-                                    )
-                                new_deployment = service.prepare_new_git_deployment(
-                                    trigger_method=Deployment.DeploymentTriggerMethod.AUTO,
+                            if not sync_arbitration.proceed:
+                                delivery_ignored = True
+                            else:
+                                affected_services = Service.get_services_triggered_by_pull_request_sync_event(
+                                    gitapp=gitapp,
+                                    repository_url=head_repository_url,
+                                    pr_number=merge_request["iid"],
                                 )
 
-                                payloads_for_workflows_to_run.append(
-                                    DeploymentDetails.from_deployment(
+                                deployments_to_cancel: list[Deployment] = []
+                                for service in affected_services:
+                                    if service.cleanup_queue_on_auto_deploy:
+                                        deployments_to_cancel.extend(
+                                            Deployment.flag_deployments_for_cancellation(
+                                                service,
+                                                include_running_deployments=True,
+                                            )
+                                        )
+                                    new_deployment = service.prepare_new_git_deployment(
+                                        trigger_method=Deployment.DeploymentTriggerMethod.AUTO,
+                                    )
+
+                                    payload = DeploymentDetails.from_deployment(
                                         deployment=new_deployment
                                     )
-                                )
-
-                            for dpl in deployments_to_cancel:
-                                workflows_signals.append(
-                                    SignalWorkflowArg(
-                                        workflow=DeployGitServiceWorkflow.run,
-                                        input=CancelDeploymentSignalInput(
-                                            deployment_hash=dpl.hash
-                                        ),
-                                        signal=DeployGitServiceWorkflow.cancel_deployment,  # type: ignore
-                                        workflow_id=dpl.workflow_id,
+                                    workflows_to_run.append(
+                                        StartWorkflowArg(
+                                            workflow=DeployGitServiceWorkflow.run,
+                                            payload=payload,
+                                            workflow_id=payload.workflow_id,
+                                        )
                                     )
-                                )
 
-                            for payload in payloads_for_workflows_to_run:
-                                workflows_to_run.append(
-                                    StartWorkflowArg(
-                                        workflow=DeployGitServiceWorkflow.run,
-                                        payload=payload,
-                                        workflow_id=payload.workflow_id,
+                                for dpl in deployments_to_cancel:
+                                    workflows_signals.append(
+                                        SignalWorkflowArg(
+                                            workflow=DeployGitServiceWorkflow.run,
+                                            input=CancelDeploymentSignalInput(
+                                                deployment_hash=dpl.hash
+                                            ),
+                                            signal=DeployGitServiceWorkflow.cancel_deployment,  # type: ignore
+                                            workflow_id=dpl.workflow_id,
+                                        )
                                     )
-                                )
+                    case "close" | "merge" if not mr_publish_allowed:
+                        # repository detached: late close/merge event
+                        pass
                     case "close" | "merge":
                         matching_preview_envs = Environment.objects.filter(
                             is_preview=True,
@@ -866,29 +1009,18 @@ class GitlabWebhookAPIView(APIView):
                             )
                             environment.delete_resources()
                             environment.delete()
-                        pass
                     case _:
                         # no need to implement other cases
                         pass
 
-                def on_commit():
-                    for signal in workflows_signals:
-                        TemporalClient.workflow_signal(
-                            workflow=signal.workflow,
-                            input=signal.input,
-                            signal=signal.signal,  # type: ignore
-                            workflow_id=signal.workflow_id,
-                        )
-                    for wf in workflows_to_run:
-                        TemporalClient.start_workflow(
-                            workflow=wf.workflow,
-                            arg=wf.payload,
-                            id=wf.workflow_id,
-                            start_delay=wf.start_delay,
-                        )
-
-                transaction.on_commit(on_commit)
             case _:
                 raise BadRequest("bad request")
+
+        if delivery_ignored:
+            # valid but superseded by a newer ref generation: acknowledge so
+            # the provider stops retrying, but create no deployment/preview.
+            mark_ignored(delivery)
+        else:
+            persist_effects_and_schedule(delivery, workflows_to_run, workflows_signals)
 
         return Response(data={"success": True})
